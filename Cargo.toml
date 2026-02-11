@@ -1,0 +1,20 @@
+[package]
+name = "sitrep"
+version = "0.1.0"
+edition = "2024"
+description = "A real-time terminal diagnostic tool for server triage — CPU, memory, disk, network, file descriptors, context switches, and socket overview at a glance."
+license = "MIT"
+repository = "https://github.com/rshzrh/sitrep"
+homepage = "https://github.com/rshzrh/sitrep"
+readme = "README.md"
+keywords = ["monitoring", "diagnostics", "terminal", "devops", "tui"]
+categories = ["command-line-utilities", "os"]
+
+[[bin]]
+name = "sitrep"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4.43"
+crossterm = "0.29.0"
+sysinfo = "0.38.1"
