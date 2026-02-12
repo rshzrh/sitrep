@@ -31,6 +31,7 @@ pub struct DiskSpaceInfo {
     pub total_gb: f64,
     pub available_gb: f64,
     pub percent_free: f64,
+    #[allow(dead_code)]
     pub is_warning: bool,
 }
 
@@ -73,6 +74,7 @@ pub struct FdInfo {
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
 pub struct ContextSwitchInfo {
     pub total_csw: u64,
     pub top_processes: Vec<(String, u64)>,
@@ -101,6 +103,7 @@ pub struct MonitorData {
     pub memory: MemoryInfo,
     pub network: NetworkInfo,
     pub fd_info: FdInfo,
+    #[allow(dead_code)]
     pub context_switches: ContextSwitchInfo,
     pub socket_overview: SocketOverviewInfo,
 }

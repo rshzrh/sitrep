@@ -6,15 +6,13 @@ When your server is busy and not responding, `sitrep` gives you the full picture
 
 ## Features
 
-- **Load Average** — 1/5/15 min with core count, red when overloaded
-- **Disk Space Warnings** — Alerts for drives with < 10% free space
-- **Memory Overview** — RAM & Swap usage with visual progress bars
+- **System Summary** — Compact, atop-style overview of Load, Memory, Swap, Disk, FD, Socket, and Network health
 - **Top 5 CPU Processes** — 60-second sliding window average, grouped by parent
 - **Top 5 Disk I/O Processes** — Read/write throughput per process group
 - **Network & Bandwidth** — Per-interface bandwidth + connection counts
-- **Open File Descriptors** — System usage vs kernel limit + top 5 processes
-- **Context Switches** — Involuntary context switch count + top 5 offenders
-- **TCP/Socket Overview** — Connection state breakdown with warnings for leaks
+- **Open File Descriptors** — Detailed breakdown of top processes by open files
+- **Socket Details** — Connection state breakdown with top processes by connection count
+- **Context Switches** — (Removed from default view)
 
 ### Interactive UI
 
