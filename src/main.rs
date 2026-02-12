@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
 use controller::Monitor;
+use model::SortColumn;
 use view::{Presenter, RowKind};
 use sysinfo::Pid;
 
@@ -109,6 +110,30 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         }
+                    }
+                    KeyCode::Char('c') => {
+                        monitor.ui_state.sort_column = SortColumn::Cpu;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('m') => {
+                        monitor.ui_state.sort_column = SortColumn::Memory;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('r') => {
+                        monitor.ui_state.sort_column = SortColumn::Read;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('w') => {
+                        monitor.ui_state.sort_column = SortColumn::Write;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('d') => {
+                        monitor.ui_state.sort_column = SortColumn::NetDown;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('u') => {
+                        monitor.ui_state.sort_column = SortColumn::NetUp;
+                        needs_render = true;
                     }
                     _ => {}
                 }

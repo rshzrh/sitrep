@@ -2,9 +2,9 @@ use crate::model::{MonitorData, UIState};
 use crate::layout::{Layout, SectionId};
 use std::io::{self, Write, stdout};
 use crossterm::{
-    cursor, execute, queue,
-    style::{Color, SetForegroundColor, SetBackgroundColor, ResetColor, Attribute, SetAttribute},
-    terminal::{Clear, ClearType},
+    cursor::{self, MoveTo}, execute, queue,
+    style::{Color, SetForegroundColor, SetBackgroundColor, ResetColor, Attribute, SetAttribute, Print},
+    terminal::{self, Clear, ClearType},
 };
 use sysinfo::Pid;
 
@@ -68,7 +68,18 @@ impl Presenter {
 
         ui_state.total_rows = current_row;
 
-        Self::writeln(&mut out, "↑↓ Navigate  →/← Expand/Collapse Section  Q Quit")?;
+        // Footer with help
+        let help = "q: Quit | Space: Pause | ↑/↓: Navigate | →/←: Expand/Collapse | Sort: (c)pu (m)em (r)ead (w)rite (d)ownload (u)pload";
+        let size = terminal::size()?;
+        let help_y = size.1.saturating_sub(1); // Use size.1 for height
+        queue!(
+            out,
+            MoveTo(1, help_y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{:<width$}", help, width = size.0 as usize)), // Use size.0 for width
+            ResetColor
+        )?;
+
         if ui_state.has_expansions() {
             queue!(out, SetForegroundColor(Color::Yellow))?;
             Self::writeln(&mut out, "(Expanded section data frozen)")?;
@@ -249,8 +260,34 @@ impl Presenter {
         out: &mut impl Write, data: &MonitorData, ui_state: &UIState,
         rows: &mut Vec<(Pid, RowKind)>, current_row: &mut usize,
     ) -> io::Result<()> {
-        Self::writeln(out, &format!("  {:<18} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {}",
-            "PID[CHILDREN]", "CPU %", "MEM (MB)", "READ/s", "WRITE/s", "NET ↓", "NET ↑", "Name"))?;
+        // Header with highlighting
+        write!(out, "  {:<18} ", "PID[CHILDREN]")?;
+
+        let headers = [
+            ("CPU %", 8, Some(crate::model::SortColumn::Cpu)),
+            ("MEM (MB)", 10, Some(crate::model::SortColumn::Memory)),
+            ("READ/s", 10, Some(crate::model::SortColumn::Read)),
+            ("WRITE/s", 10, Some(crate::model::SortColumn::Write)),
+            ("NET ↓", 10, Some(crate::model::SortColumn::NetDown)),
+            ("NET ↑", 10, Some(crate::model::SortColumn::NetUp)),
+            ("Name", 0, None),
+        ];
+
+        for (text, width, col) in headers {
+            let is_sorted = col.map_or(false, |c| c == ui_state.sort_column);
+            if is_sorted {
+                queue!(out, SetAttribute(Attribute::Reverse))?;
+            }
+            if width > 0 {
+                write!(out, "{:<width$} ", text, width = width)?;
+            } else {
+                write!(out, "{}", text)?;
+            }
+            if is_sorted {
+                queue!(out, SetAttribute(Attribute::Reset))?;
+            }
+        }
+        write!(out, "\r\n")?;
             
         for g in &data.historical_top {
             let pid_label = format!("{}[{}]", g.pid, g.child_count);

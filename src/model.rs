@@ -115,21 +115,34 @@ pub struct MonitorData {
 
 // --- UI State ---
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortColumn {
+    Cpu,
+    Memory,
+    Read,
+    Write,
+    NetDown,
+    NetUp,
+}
+
 pub struct UIState {
     pub selected_index: usize,
     pub expanded_pids: HashSet<Pid>,
     pub total_rows: usize,
+    pub sort_column: SortColumn,
 }
 
-impl UIState {
-    pub fn new() -> Self {
+impl Default for UIState {
+    fn default() -> Self {
         Self {
             selected_index: 0,
             expanded_pids: HashSet::new(),
             total_rows: 0,
+            sort_column: SortColumn::Cpu,
         }
     }
-
+}
+impl UIState {
     pub fn has_expansions(&self) -> bool {
         !self.expanded_pids.is_empty()
     }

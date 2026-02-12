@@ -3,7 +3,12 @@ use std::time::{Duration, Instant};
 use std::collections::{HashMap, VecDeque};
 use std::process::Command;
 use chrono::Local;
-use crate::model::*;
+use crate::model::{
+    MonitorData, ProcessGroup, ProcessInfo, UIState, SortColumn,
+    SocketOverviewInfo, ContextSwitchInfo, FdInfo,
+    NetworkInfo, NetworkProcessInfo, NetworkInterfaceInfo,
+    MemoryInfo, DiskSpaceInfo
+};
 use crate::layout::Layout;
 
 pub struct Monitor {
@@ -32,7 +37,7 @@ impl Monitor {
             disks,
             networks,
             prev_net_snapshot: None,
-            ui_state: UIState::new(),
+            ui_state: UIState::default(),
             layout: Layout::default_layout(),
             last_data: None,
         }
@@ -216,8 +221,17 @@ impl Monitor {
             })
             .collect();
             
-        top.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap());
-        top.into_iter().take(5).collect()
+            top.sort_by(|a, b| {
+                match self.ui_state.sort_column {
+                    SortColumn::Cpu => b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal),
+                    SortColumn::Memory => b.mem.cmp(&a.mem),
+                    SortColumn::Read => b.read_bytes.cmp(&a.read_bytes),
+                    SortColumn::Write => b.written_bytes.cmp(&a.written_bytes),
+                    SortColumn::NetDown => b.net_rx_bytes.cmp(&a.net_rx_bytes),
+                    SortColumn::NetUp => b.net_tx_bytes.cmp(&a.net_tx_bytes),
+                }
+            });
+        top.into_iter().take(10).collect()
     }
 
     // --- New data collectors ---
