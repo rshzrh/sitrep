@@ -10,6 +10,8 @@ pub struct ProcessInfo {
     pub mem: u64,
     pub read_bytes: u64,
     pub written_bytes: u64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
     pub name: String,
 }
 
@@ -20,6 +22,8 @@ pub struct ProcessGroup {
     pub mem: u64,
     pub read_bytes: u64,
     pub written_bytes: u64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
     pub child_count: usize,
     pub name: String,
     pub children: Vec<ProcessInfo>,

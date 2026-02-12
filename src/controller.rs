@@ -47,6 +47,9 @@ impl Monitor {
         let now_instant = Instant::now();
         let load_avg_raw = System::load_average();
 
+        // Pre-fetch network stats
+        let net_stats = Self::collect_process_network_stats();
+
         // --- Process grouping ---
         let mut live_groups: HashMap<Pid, ProcessGroup> = HashMap::new();
         for p in self.sys.processes().values() {
@@ -57,22 +60,33 @@ impl Monitor {
                 mem: 0,
                 read_bytes: 0,
                 written_bytes: 0,
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
                 child_count: 0,
                 name: p.name().to_string_lossy().into_owned(),
                 children: Vec::new(),
             });
+
             group.cpu += p.cpu_usage() as f64;
             group.mem += p.memory();
             group.read_bytes += p.disk_usage().read_bytes;
             group.written_bytes += p.disk_usage().written_bytes;
+
+            let (proc_rx, proc_tx) = *net_stats.get(&p.pid()).unwrap_or(&(0, 0));
+            group.net_rx_bytes += proc_rx;
+            group.net_tx_bytes += proc_tx;
+
             group.children.push(ProcessInfo {
                 pid: p.pid(),
                 cpu: p.cpu_usage(),
                 mem: p.memory(),
                 read_bytes: p.disk_usage().read_bytes,
                 written_bytes: p.disk_usage().written_bytes,
+                net_rx_bytes: proc_rx,
+                net_tx_bytes: proc_tx,
                 name: p.name().to_string_lossy().into_owned(),
             });
+
             if p.parent().is_some() {
                 group.child_count += 1;
             }
@@ -128,9 +142,18 @@ impl Monitor {
         // PID -> (total_cpu, total_mem, samples, child_count, name, children)
         let mut cpu_totals: HashMap<Pid, (f64, u64, f64, usize, String, Vec<ProcessInfo>)> = HashMap::new();
         
-        // Track first/last snapshots for Disk I/O rate calculation
-        // PID -> (first_read, first_written, first_time, last_read, last_written, last_time)
-        let mut disk_stats: HashMap<Pid, (u64, u64, Instant, u64, u64, Instant)> = HashMap::new();
+        // Track first/last for Disk & Net rate calculation
+        // PID -> (first_read, first_written, first_net_rx, first_net_tx, first_time, 
+        //         last_read, last_written, last_net_rx, last_net_tx, last_time)
+        struct Stats {
+            first_disk: (u64, u64),
+            first_net: (u64, u64),
+            first_time: Instant,
+            last_disk: (u64, u64),
+            last_net: (u64, u64),
+            last_time: Instant,
+        }
+        let mut rate_stats: HashMap<Pid, Stats> = HashMap::new();
 
         for (timestamp, snapshot) in &self.history {
             for (pid, group) in snapshot {
@@ -141,33 +164,41 @@ impl Monitor {
                 entry.2 += 1.0;
                 entry.3 = group.child_count;
                 
-                // Disk Stats Tracking
-                disk_stats.entry(*pid)
+                // Rate Stats Tracking
+                rate_stats.entry(*pid)
                     .and_modify(|stats| {
-                        // Update last seen
-                        stats.3 = group.read_bytes;
-                        stats.4 = group.written_bytes;
-                        stats.5 = *timestamp;
+                        stats.last_disk = (group.read_bytes, group.written_bytes);
+                        stats.last_net = (group.net_rx_bytes, group.net_tx_bytes);
+                        stats.last_time = *timestamp;
                     })
-                    .or_insert((group.read_bytes, group.written_bytes, *timestamp, group.read_bytes, group.written_bytes, *timestamp));
+                    .or_insert(Stats {
+                        first_disk: (group.read_bytes, group.written_bytes),
+                        first_net: (group.net_rx_bytes, group.net_tx_bytes),
+                        first_time: *timestamp,
+                        last_disk: (group.read_bytes, group.written_bytes),
+                        last_net: (group.net_rx_bytes, group.net_tx_bytes),
+                        last_time: *timestamp,
+                    });
             }
         }
 
         let mut top: Vec<ProcessGroup> = cpu_totals
             .into_iter()
             .map(|(pid, (total_cpu, total_mem, samples, child_count, name, children))| {
-                let (read_rate, write_rate) = if let Some((first_r, first_w, first_t, last_r, last_w, last_t)) = disk_stats.get(&pid) {
-                    let duration = last_t.duration_since(*first_t).as_secs_f64();
+                let (read_rate, write_rate, net_rx_rate, net_tx_rate) = if let Some(stats) = rate_stats.get(&pid) {
+                    let duration = stats.last_time.duration_since(stats.first_time).as_secs_f64();
                     if duration > 0.1 {
                         (
-                            ((last_r.saturating_sub(*first_r)) as f64 / duration) as u64,
-                            ((last_w.saturating_sub(*first_w)) as f64 / duration) as u64
+                            ((stats.last_disk.0.saturating_sub(stats.first_disk.0)) as f64 / duration) as u64,
+                            ((stats.last_disk.1.saturating_sub(stats.first_disk.1)) as f64 / duration) as u64,
+                            ((stats.last_net.0.saturating_sub(stats.first_net.0)) as f64 / duration) as u64,
+                            ((stats.last_net.1.saturating_sub(stats.first_net.1)) as f64 / duration) as u64
                         )
                     } else {
-                        (0, 0)
+                        (0, 0, 0, 0)
                     }
                 } else {
-                    (0, 0)
+                    (0, 0, 0, 0)
                 };
 
                 ProcessGroup {
@@ -176,6 +207,8 @@ impl Monitor {
                     mem: total_mem / samples as u64,
                     read_bytes: read_rate,
                     written_bytes: write_rate,
+                    net_rx_bytes: net_rx_rate,
+                    net_tx_bytes: net_tx_rate,
                     child_count, 
                     name, 
                     children,
@@ -371,6 +404,32 @@ impl Monitor {
         top_processes.truncate(5);
 
         ContextSwitchInfo { total_csw, top_processes }
+    }
+
+    fn collect_process_network_stats() -> HashMap<Pid, (u64, u64)> {
+        let mut stats = HashMap::new();
+        // nettop -P -L 1
+        // Output format: time,name.pid,?,?,bytes_in,bytes_out,...
+        if let Ok(output) = Command::new("nettop").args(["-P", "-L", "1"]).output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines().skip(1) { // Skip header if present (though -L 1 usually has header)
+                // Actually nettop -P -L 1 output varies. Let's assume standard CSV.
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 6 {
+                    // split name.pid
+                    if let Some(name_pid) = parts.get(1) {
+                        if let Some(last_dot) = name_pid.rfind('.') {
+                            if let Ok(pid) = name_pid[last_dot+1..].parse::<Pid>() {
+                                let bytes_in = parts.get(4).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
+                                let bytes_out = parts.get(5).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
+                                stats.insert(pid, (bytes_in, bytes_out));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stats
     }
 
     fn collect_socket_overview() -> SocketOverviewInfo {

@@ -249,17 +249,19 @@ impl Presenter {
         out: &mut impl Write, data: &MonitorData, ui_state: &UIState,
         rows: &mut Vec<(Pid, RowKind)>, current_row: &mut usize,
     ) -> io::Result<()> {
-        Self::writeln(out, &format!("  {:<18} {:<8} {:<10} {:<10} {:<10} {}",
-            "PID[CHILDREN]", "CPU %", "MEM (MB)", "READ/s", "WRITE/s", "Name"))?;
+        Self::writeln(out, &format!("  {:<18} {:<8} {:<10} {:<10} {:<10} {:<10} {:<10} {}",
+            "PID[CHILDREN]", "CPU %", "MEM (MB)", "READ/s", "WRITE/s", "NET ↓", "NET ↑", "Name"))?;
             
         for g in &data.historical_top {
             let pid_label = format!("{}[{}]", g.pid, g.child_count);
             let mem_mb = g.mem as f64 / 1_048_576.0;
             let read_fmt = Self::format_bytes_rate(g.read_bytes);
             let write_fmt = Self::format_bytes_rate(g.written_bytes);
+            let net_rx_fmt = Self::format_bytes_rate(g.net_rx_bytes);
+            let net_tx_fmt = Self::format_bytes_rate(g.net_tx_bytes);
             
-            let line = format!("  {:<18} {:<8.1} {:<10.1} {:<10} {:<10} {}", 
-                pid_label, g.cpu, mem_mb, read_fmt, write_fmt, g.name);
+            let line = format!("  {:<18} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}", 
+                pid_label, g.cpu, mem_mb, read_fmt, write_fmt, net_rx_fmt, net_tx_fmt, g.name);
                 
             Self::write_selectable(out, &line, *current_row == ui_state.selected_index)?;
             rows.push((g.pid, RowKind::ProcessParent));
@@ -269,9 +271,12 @@ impl Presenter {
                 for child in &g.children {
                     let child_read = Self::format_bytes_rate(child.read_bytes);
                     let child_write = Self::format_bytes_rate(child.written_bytes);
-                    let child_line = format!("    {:<16} {:<8.1} {:<10.1} {:<10} {:<10} {}",
+                    let child_net_rx = Self::format_bytes_rate(child.net_rx_bytes);
+                    let child_net_tx = Self::format_bytes_rate(child.net_tx_bytes);
+                    
+                    let child_line = format!("    {:<16} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
                         child.pid, child.cpu, child.mem as f64 / 1_048_576.0, 
-                        child_read, child_write, child.name);
+                        child_read, child_write, child_net_rx, child_net_tx, child.name);
                         
                     Self::write_selectable(out, &child_line, *current_row == ui_state.selected_index)?;
                     rows.push((child.pid, RowKind::ProcessChild));
