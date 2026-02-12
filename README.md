@@ -6,26 +6,24 @@ When your server is busy and not responding, `sitrep` gives you the full picture
 
 ## Features
 
-- **Load Average** — 1/5/15 min with core count, red when overloaded
-- **Disk Space Warnings** — Alerts for drives with < 10% free space
-- **Memory Overview** — RAM & Swap usage with visual progress bars
-- **Top 5 CPU Processes** — 60-second sliding window average, grouped by parent
-- **Top 5 Disk I/O Processes** — Read/write throughput per process group
-- **Network & Bandwidth** — Per-interface bandwidth + connection counts
-- **Open File Descriptors** — System usage vs kernel limit + top 5 processes
-- **Context Switches** — Involuntary context switch count + top 5 offenders
-- **TCP/Socket Overview** — Connection state breakdown with warnings for leaks
+- **System Summary**: 
+  - **Load Average**: 1m, 5m, 15m averages with core count context.
+  - **Memory & Swap**: Visual progress bars and usage stats.
+  - **Disk Usage**: Overview of all mounted disks with warning indicators (< 10% free).
+  - **Network**: Monitor interface bandwidth (upload/download) and connection counts.
+  - **File Descriptors**: Track system-wide usage and top consumers.
+  - **Socket Connections**: Overview of TCP states (ESTABLISHED, TIME_WAIT, etc.).
 
-### Interactive UI
+- **Top Processes List**:
+  - **Unified View**: Combines CPU, Memory, Disk I/O, and Network usage in one list.
+  - **Sortable**: Dynamically sort by **CPU** (default), **Memory**, **Read**, **Write**, **Download**, or **Upload**.
+  - **Expandable**: Grouped by parent process; expand to see child processes.
+  - **Network Stats**: Per-process upload/download rates sourced from `nettop`.
 
-- **↑↓** Navigate between rows
-- **→** Expand section or process children
-- **←** Collapse section or process children
-- **Q / Esc / Ctrl+C** Quit
-
-All sections are **collapsible** — collapse what you don't need, focus on what matters.
-
-Data freezes for expanded sections so you can inspect process details without the display jumping around.
+- **Interactivity**:
+  - **Navigation**: Arrow keys to scroll and expand/collapse.
+  - **Sorting**: Keys `c`, `m`, `r`, `w`, `d`, `u` to sort the process list.
+  - **Pause**: Spacebar to pause/resume updates.
 
 ## Installation
 
@@ -50,21 +48,20 @@ cargo build --release
 sitrep
 ```
 
-That's it. No flags, no config files. Just run it and get your situation report.
+### Controls
 
-## Requirements
+- `q`: Quit
+- `Space`: Pause/Resumze
+- `↑ / ↓`: Navigate list
+- `→`: Expand process group (or collapse section)
+- `←`: Collapse process group (or expand section)
+- `c`: Sort by CPU
+- `m`: Sort by Memory
+- `r`: Sort by Disk Read
+- `w`: Sort by Disk Write
+- `d`: Sort by Network Download
+- `u`: Sort by Network Upload
 
-- **macOS** (primary target — uses macOS-specific system commands)
-- Linux support planned for a future release
-
-## How It Works
-
-`sitrep` uses:
-- [`sysinfo`](https://crates.io/crates/sysinfo) for CPU, memory, disk, and network data
-- [`crossterm`](https://crates.io/crates/crossterm) for the terminal UI
-- System commands (`lsof`, `netstat`, `ps`, `iostat`, `sysctl`) for deeper diagnostics
-
-Data is refreshed every 3 seconds. Process CPU usage is averaged over a 60-second sliding window for stable readings.
 
 ## Architecture
 

@@ -11,6 +11,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
 use controller::Monitor;
+use model::SortColumn;
 use view::{Presenter, RowKind};
 use sysinfo::Pid;
 
@@ -71,12 +72,8 @@ fn main() -> io::Result<()> {
                                         needs_render = true;
                                     }
                                 }
-                                RowKind::CpuParent => {
-                                    monitor.ui_state.cpu_expanded_pids.insert(pid);
-                                    needs_render = true;
-                                }
-                                RowKind::DiskParent => {
-                                    monitor.ui_state.disk_expanded_pids.insert(pid);
+                                RowKind::ProcessParent => {
+                                    monitor.ui_state.expanded_pids.insert(pid);
                                     needs_render = true;
                                 }
                                 _ => {}
@@ -94,33 +91,17 @@ fn main() -> io::Result<()> {
                                         needs_render = true;
                                     }
                                 }
-                                RowKind::CpuParent => {
-                                    monitor.ui_state.cpu_expanded_pids.remove(&pid);
+                                RowKind::ProcessParent => {
+                                    monitor.ui_state.expanded_pids.remove(&pid);
                                     needs_render = true;
                                 }
-                                RowKind::DiskParent => {
-                                    monitor.ui_state.disk_expanded_pids.remove(&pid);
-                                    needs_render = true;
-                                }
-                                RowKind::CpuChild => {
+                                RowKind::ProcessChild => {
                                     // Find parent and collapse
                                     let mut idx = monitor.ui_state.selected_index;
                                     while idx > 0 {
                                         idx -= 1;
-                                        if row_mapping[idx].1 == RowKind::CpuParent {
-                                            monitor.ui_state.cpu_expanded_pids.remove(&row_mapping[idx].0);
-                                            monitor.ui_state.selected_index = idx;
-                                            needs_render = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                RowKind::DiskChild => {
-                                    let mut idx = monitor.ui_state.selected_index;
-                                    while idx > 0 {
-                                        idx -= 1;
-                                        if row_mapping[idx].1 == RowKind::DiskParent {
-                                            monitor.ui_state.disk_expanded_pids.remove(&row_mapping[idx].0);
+                                        if row_mapping[idx].1 == RowKind::ProcessParent {
+                                            monitor.ui_state.expanded_pids.remove(&row_mapping[idx].0);
                                             monitor.ui_state.selected_index = idx;
                                             needs_render = true;
                                             break;
@@ -129,6 +110,30 @@ fn main() -> io::Result<()> {
                                 }
                             }
                         }
+                    }
+                    KeyCode::Char('c') => {
+                        monitor.ui_state.sort_column = SortColumn::Cpu;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('m') => {
+                        monitor.ui_state.sort_column = SortColumn::Memory;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('r') => {
+                        monitor.ui_state.sort_column = SortColumn::Read;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('w') => {
+                        monitor.ui_state.sort_column = SortColumn::Write;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('d') => {
+                        monitor.ui_state.sort_column = SortColumn::NetDown;
+                        needs_render = true;
+                    }
+                    KeyCode::Char('u') => {
+                        monitor.ui_state.sort_column = SortColumn::NetUp;
+                        needs_render = true;
                     }
                     _ => {}
                 }

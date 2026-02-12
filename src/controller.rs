@@ -3,7 +3,12 @@ use std::time::{Duration, Instant};
 use std::collections::{HashMap, VecDeque};
 use std::process::Command;
 use chrono::Local;
-use crate::model::*;
+use crate::model::{
+    MonitorData, ProcessGroup, ProcessInfo, UIState, SortColumn,
+    SocketOverviewInfo, ContextSwitchInfo, FdInfo,
+    NetworkInfo, NetworkProcessInfo, NetworkInterfaceInfo,
+    MemoryInfo, DiskSpaceInfo
+};
 use crate::layout::Layout;
 
 pub struct Monitor {
@@ -32,7 +37,7 @@ impl Monitor {
             disks,
             networks,
             prev_net_snapshot: None,
-            ui_state: UIState::new(),
+            ui_state: UIState::default(),
             layout: Layout::default_layout(),
             last_data: None,
         }
@@ -47,6 +52,9 @@ impl Monitor {
         let now_instant = Instant::now();
         let load_avg_raw = System::load_average();
 
+        // Pre-fetch network stats
+        let net_stats = Self::collect_process_network_stats();
+
         // --- Process grouping ---
         let mut live_groups: HashMap<Pid, ProcessGroup> = HashMap::new();
         for p in self.sys.processes().values() {
@@ -57,20 +65,33 @@ impl Monitor {
                 mem: 0,
                 read_bytes: 0,
                 written_bytes: 0,
+                net_rx_bytes: 0,
+                net_tx_bytes: 0,
                 child_count: 0,
                 name: p.name().to_string_lossy().into_owned(),
                 children: Vec::new(),
             });
+
             group.cpu += p.cpu_usage() as f64;
             group.mem += p.memory();
             group.read_bytes += p.disk_usage().read_bytes;
             group.written_bytes += p.disk_usage().written_bytes;
+
+            let (proc_rx, proc_tx) = *net_stats.get(&p.pid()).unwrap_or(&(0, 0));
+            group.net_rx_bytes += proc_rx;
+            group.net_tx_bytes += proc_tx;
+
             group.children.push(ProcessInfo {
                 pid: p.pid(),
                 cpu: p.cpu_usage(),
                 mem: p.memory(),
+                read_bytes: p.disk_usage().read_bytes,
+                written_bytes: p.disk_usage().written_bytes,
+                net_rx_bytes: proc_rx,
+                net_tx_bytes: proc_tx,
                 name: p.name().to_string_lossy().into_owned(),
             });
+
             if p.parent().is_some() {
                 group.child_count += 1;
             }
@@ -87,17 +108,10 @@ impl Monitor {
         }
 
         // --- CPU top (freeze if expanded) ---
-        let new_cpu_top = if self.ui_state.cpu_expanded_pids.is_empty() {
+        let new_cpu_top = if self.ui_state.expanded_pids.is_empty() {
             self.compute_cpu_top()
         } else {
             self.last_data.as_ref().map(|d| d.historical_top.clone()).unwrap_or_default()
-        };
-
-        // --- Disk I/O top (freeze if expanded) ---
-        let new_disk_top = if self.ui_state.disk_expanded_pids.is_empty() {
-            self.compute_disk_top()
-        } else {
-            self.last_data.as_ref().map(|d| d.historical_disk_top.clone()).unwrap_or_default()
         };
 
         // --- New sections ---
@@ -114,7 +128,6 @@ impl Monitor {
             core_count: self.core_count,
             load_avg: (load_avg_raw.one, load_avg_raw.five, load_avg_raw.fifteen),
             historical_top: new_cpu_top,
-            historical_disk_top: new_disk_top,
             disk_space,
             disk_busy_pct,
             memory,
@@ -129,50 +142,96 @@ impl Monitor {
 
     fn compute_cpu_top(&self) -> Vec<ProcessGroup> {
         if self.history.is_empty() { return Vec::new(); }
+        
+        // Track totals for averaging CPU/Mem
+        // PID -> (total_cpu, total_mem, samples, child_count, name, children)
         let mut cpu_totals: HashMap<Pid, (f64, u64, f64, usize, String, Vec<ProcessInfo>)> = HashMap::new();
-        for (_, snapshot) in &self.history {
+        
+        // Track first/last for Disk & Net rate calculation
+        // PID -> (first_read, first_written, first_net_rx, first_net_tx, first_time, 
+        //         last_read, last_written, last_net_rx, last_net_tx, last_time)
+        struct Stats {
+            first_disk: (u64, u64),
+            first_net: (u64, u64),
+            first_time: Instant,
+            last_disk: (u64, u64),
+            last_net: (u64, u64),
+            last_time: Instant,
+        }
+        let mut rate_stats: HashMap<Pid, Stats> = HashMap::new();
+
+        for (timestamp, snapshot) in &self.history {
             for (pid, group) in snapshot {
+                // CPU Accumulation
                 let entry = cpu_totals.entry(*pid).or_insert((0.0, 0, 0.0, 0, group.name.clone(), group.children.clone()));
                 entry.0 += group.cpu;
                 entry.1 += group.mem;
                 entry.2 += 1.0;
                 entry.3 = group.child_count;
+                
+                // Rate Stats Tracking
+                rate_stats.entry(*pid)
+                    .and_modify(|stats| {
+                        stats.last_disk = (group.read_bytes, group.written_bytes);
+                        stats.last_net = (group.net_rx_bytes, group.net_tx_bytes);
+                        stats.last_time = *timestamp;
+                    })
+                    .or_insert(Stats {
+                        first_disk: (group.read_bytes, group.written_bytes),
+                        first_net: (group.net_rx_bytes, group.net_tx_bytes),
+                        first_time: *timestamp,
+                        last_disk: (group.read_bytes, group.written_bytes),
+                        last_net: (group.net_rx_bytes, group.net_tx_bytes),
+                        last_time: *timestamp,
+                    });
             }
         }
+
         let mut top: Vec<ProcessGroup> = cpu_totals
             .into_iter()
-            .map(|(pid, (total_cpu, total_mem, samples, child_count, name, children))| ProcessGroup {
-                pid, cpu: total_cpu / samples, mem: total_mem / samples as u64,
-                read_bytes: 0, written_bytes: 0, child_count, name, children,
+            .map(|(pid, (total_cpu, total_mem, samples, child_count, name, children))| {
+                let (read_rate, write_rate, net_rx_rate, net_tx_rate) = if let Some(stats) = rate_stats.get(&pid) {
+                    let duration = stats.last_time.duration_since(stats.first_time).as_secs_f64();
+                    if duration > 0.1 {
+                        (
+                            ((stats.last_disk.0.saturating_sub(stats.first_disk.0)) as f64 / duration) as u64,
+                            ((stats.last_disk.1.saturating_sub(stats.first_disk.1)) as f64 / duration) as u64,
+                            ((stats.last_net.0.saturating_sub(stats.first_net.0)) as f64 / duration) as u64,
+                            ((stats.last_net.1.saturating_sub(stats.first_net.1)) as f64 / duration) as u64
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    }
+                } else {
+                    (0, 0, 0, 0)
+                };
+
+                ProcessGroup {
+                    pid, 
+                    cpu: total_cpu / samples, 
+                    mem: total_mem / samples as u64,
+                    read_bytes: read_rate,
+                    written_bytes: write_rate,
+                    net_rx_bytes: net_rx_rate,
+                    net_tx_bytes: net_tx_rate,
+                    child_count, 
+                    name, 
+                    children,
+                }
             })
             .collect();
-        top.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap());
-        top.into_iter().take(5).collect()
-    }
-
-    fn compute_disk_top(&self) -> Vec<ProcessGroup> {
-        if let (Some(first), Some(last)) = (self.history.front(), self.history.back()) {
-            let duration = last.0.duration_since(first.0).as_secs_f64();
-            if duration > 0.1 {
-                let mut disk_groups: Vec<ProcessGroup> = Vec::new();
-                for (pid, last_group) in &last.1 {
-                    if let Some(first_group) = first.1.get(pid) {
-                        let read_delta = last_group.read_bytes.saturating_sub(first_group.read_bytes);
-                        let write_delta = last_group.written_bytes.saturating_sub(first_group.written_bytes);
-                        disk_groups.push(ProcessGroup {
-                            pid: *pid, cpu: last_group.cpu, mem: last_group.mem,
-                            read_bytes: (read_delta as f64 / duration) as u64,
-                            written_bytes: (write_delta as f64 / duration) as u64,
-                            child_count: last_group.child_count,
-                            name: last_group.name.clone(), children: last_group.children.clone(),
-                        });
-                    }
+            
+            top.sort_by(|a, b| {
+                match self.ui_state.sort_column {
+                    SortColumn::Cpu => b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal),
+                    SortColumn::Memory => b.mem.cmp(&a.mem),
+                    SortColumn::Read => b.read_bytes.cmp(&a.read_bytes),
+                    SortColumn::Write => b.written_bytes.cmp(&a.written_bytes),
+                    SortColumn::NetDown => b.net_rx_bytes.cmp(&a.net_rx_bytes),
+                    SortColumn::NetUp => b.net_tx_bytes.cmp(&a.net_tx_bytes),
                 }
-                disk_groups.sort_by(|a, b| (b.read_bytes + b.written_bytes).cmp(&(a.read_bytes + a.written_bytes)));
-                return disk_groups.into_iter().take(5).collect();
-            }
-        }
-        Vec::new()
+            });
+        top.into_iter().take(10).collect()
     }
 
     // --- New data collectors ---
@@ -359,6 +418,32 @@ impl Monitor {
         top_processes.truncate(5);
 
         ContextSwitchInfo { total_csw, top_processes }
+    }
+
+    fn collect_process_network_stats() -> HashMap<Pid, (u64, u64)> {
+        let mut stats = HashMap::new();
+        // nettop -P -L 1
+        // Output format: time,name.pid,?,?,bytes_in,bytes_out,...
+        if let Ok(output) = Command::new("nettop").args(["-P", "-L", "1"]).output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines().skip(1) { // Skip header if present (though -L 1 usually has header)
+                // Actually nettop -P -L 1 output varies. Let's assume standard CSV.
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 6 {
+                    // split name.pid
+                    if let Some(name_pid) = parts.get(1) {
+                        if let Some(last_dot) = name_pid.rfind('.') {
+                            if let Ok(pid) = name_pid[last_dot+1..].parse::<Pid>() {
+                                let bytes_in = parts.get(4).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
+                                let bytes_out = parts.get(5).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
+                                stats.insert(pid, (bytes_in, bytes_out));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stats
     }
 
     fn collect_socket_overview() -> SocketOverviewInfo {
