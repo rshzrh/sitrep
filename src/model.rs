@@ -8,6 +8,8 @@ pub struct ProcessInfo {
     pub pid: Pid,
     pub cpu: f32,
     pub mem: u64,
+    pub read_bytes: u64,
+    pub written_bytes: u64,
     pub name: String,
 }
 
@@ -97,7 +99,6 @@ pub struct MonitorData {
     pub core_count: f64,
     pub load_avg: (f64, f64, f64),
     pub historical_top: Vec<ProcessGroup>,
-    pub historical_disk_top: Vec<ProcessGroup>,
     pub disk_space: Vec<DiskSpaceInfo>,
     pub disk_busy_pct: f64,
     pub memory: MemoryInfo,
@@ -112,8 +113,7 @@ pub struct MonitorData {
 
 pub struct UIState {
     pub selected_index: usize,
-    pub cpu_expanded_pids: HashSet<Pid>,
-    pub disk_expanded_pids: HashSet<Pid>,
+    pub expanded_pids: HashSet<Pid>,
     pub total_rows: usize,
 }
 
@@ -121,13 +121,12 @@ impl UIState {
     pub fn new() -> Self {
         Self {
             selected_index: 0,
-            cpu_expanded_pids: HashSet::new(),
-            disk_expanded_pids: HashSet::new(),
+            expanded_pids: HashSet::new(),
             total_rows: 0,
         }
     }
 
     pub fn has_expansions(&self) -> bool {
-        !self.cpu_expanded_pids.is_empty() || !self.disk_expanded_pids.is_empty()
+        !self.expanded_pids.is_empty()
     }
 }

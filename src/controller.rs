@@ -69,6 +69,8 @@ impl Monitor {
                 pid: p.pid(),
                 cpu: p.cpu_usage(),
                 mem: p.memory(),
+                read_bytes: p.disk_usage().read_bytes,
+                written_bytes: p.disk_usage().written_bytes,
                 name: p.name().to_string_lossy().into_owned(),
             });
             if p.parent().is_some() {
@@ -87,17 +89,10 @@ impl Monitor {
         }
 
         // --- CPU top (freeze if expanded) ---
-        let new_cpu_top = if self.ui_state.cpu_expanded_pids.is_empty() {
+        let new_cpu_top = if self.ui_state.expanded_pids.is_empty() {
             self.compute_cpu_top()
         } else {
             self.last_data.as_ref().map(|d| d.historical_top.clone()).unwrap_or_default()
-        };
-
-        // --- Disk I/O top (freeze if expanded) ---
-        let new_disk_top = if self.ui_state.disk_expanded_pids.is_empty() {
-            self.compute_disk_top()
-        } else {
-            self.last_data.as_ref().map(|d| d.historical_disk_top.clone()).unwrap_or_default()
         };
 
         // --- New sections ---
@@ -114,7 +109,6 @@ impl Monitor {
             core_count: self.core_count,
             load_avg: (load_avg_raw.one, load_avg_raw.five, load_avg_raw.fifteen),
             historical_top: new_cpu_top,
-            historical_disk_top: new_disk_top,
             disk_space,
             disk_busy_pct,
             memory,
@@ -129,50 +123,68 @@ impl Monitor {
 
     fn compute_cpu_top(&self) -> Vec<ProcessGroup> {
         if self.history.is_empty() { return Vec::new(); }
+        
+        // Track totals for averaging CPU/Mem
+        // PID -> (total_cpu, total_mem, samples, child_count, name, children)
         let mut cpu_totals: HashMap<Pid, (f64, u64, f64, usize, String, Vec<ProcessInfo>)> = HashMap::new();
-        for (_, snapshot) in &self.history {
+        
+        // Track first/last snapshots for Disk I/O rate calculation
+        // PID -> (first_read, first_written, first_time, last_read, last_written, last_time)
+        let mut disk_stats: HashMap<Pid, (u64, u64, Instant, u64, u64, Instant)> = HashMap::new();
+
+        for (timestamp, snapshot) in &self.history {
             for (pid, group) in snapshot {
+                // CPU Accumulation
                 let entry = cpu_totals.entry(*pid).or_insert((0.0, 0, 0.0, 0, group.name.clone(), group.children.clone()));
                 entry.0 += group.cpu;
                 entry.1 += group.mem;
                 entry.2 += 1.0;
                 entry.3 = group.child_count;
+                
+                // Disk Stats Tracking
+                disk_stats.entry(*pid)
+                    .and_modify(|stats| {
+                        // Update last seen
+                        stats.3 = group.read_bytes;
+                        stats.4 = group.written_bytes;
+                        stats.5 = *timestamp;
+                    })
+                    .or_insert((group.read_bytes, group.written_bytes, *timestamp, group.read_bytes, group.written_bytes, *timestamp));
             }
         }
+
         let mut top: Vec<ProcessGroup> = cpu_totals
             .into_iter()
-            .map(|(pid, (total_cpu, total_mem, samples, child_count, name, children))| ProcessGroup {
-                pid, cpu: total_cpu / samples, mem: total_mem / samples as u64,
-                read_bytes: 0, written_bytes: 0, child_count, name, children,
+            .map(|(pid, (total_cpu, total_mem, samples, child_count, name, children))| {
+                let (read_rate, write_rate) = if let Some((first_r, first_w, first_t, last_r, last_w, last_t)) = disk_stats.get(&pid) {
+                    let duration = last_t.duration_since(*first_t).as_secs_f64();
+                    if duration > 0.1 {
+                        (
+                            ((last_r.saturating_sub(*first_r)) as f64 / duration) as u64,
+                            ((last_w.saturating_sub(*first_w)) as f64 / duration) as u64
+                        )
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+
+                ProcessGroup {
+                    pid, 
+                    cpu: total_cpu / samples, 
+                    mem: total_mem / samples as u64,
+                    read_bytes: read_rate,
+                    written_bytes: write_rate,
+                    child_count, 
+                    name, 
+                    children,
+                }
             })
             .collect();
+            
         top.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap());
         top.into_iter().take(5).collect()
-    }
-
-    fn compute_disk_top(&self) -> Vec<ProcessGroup> {
-        if let (Some(first), Some(last)) = (self.history.front(), self.history.back()) {
-            let duration = last.0.duration_since(first.0).as_secs_f64();
-            if duration > 0.1 {
-                let mut disk_groups: Vec<ProcessGroup> = Vec::new();
-                for (pid, last_group) in &last.1 {
-                    if let Some(first_group) = first.1.get(pid) {
-                        let read_delta = last_group.read_bytes.saturating_sub(first_group.read_bytes);
-                        let write_delta = last_group.written_bytes.saturating_sub(first_group.written_bytes);
-                        disk_groups.push(ProcessGroup {
-                            pid: *pid, cpu: last_group.cpu, mem: last_group.mem,
-                            read_bytes: (read_delta as f64 / duration) as u64,
-                            written_bytes: (write_delta as f64 / duration) as u64,
-                            child_count: last_group.child_count,
-                            name: last_group.name.clone(), children: last_group.children.clone(),
-                        });
-                    }
-                }
-                disk_groups.sort_by(|a, b| (b.read_bytes + b.written_bytes).cmp(&(a.read_bytes + a.written_bytes)));
-                return disk_groups.into_iter().take(5).collect();
-            }
-        }
-        Vec::new()
     }
 
     // --- New data collectors ---

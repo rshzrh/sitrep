@@ -12,10 +12,8 @@ use sysinfo::Pid;
 #[derive(Clone, Copy, PartialEq)]
 pub enum RowKind {
     SectionHeader(SectionId),
-    CpuParent,
-    CpuChild,
-    DiskParent,
-    DiskChild,
+    ProcessParent,
+    ProcessChild,
 }
 
 pub struct Presenter;
@@ -58,11 +56,8 @@ impl Presenter {
 
             match section.id {
                 SectionId::Summary => {}, // Handled above
-                SectionId::CpuProcesses => {
-                    Self::render_cpu_processes(&mut out, data, ui_state, &mut rows, &mut current_row)?;
-                }
-                SectionId::DiskIo => {
-                    Self::render_disk_io(&mut out, data, ui_state, &mut rows, &mut current_row)?;
+                SectionId::Processes => {
+                    Self::render_processes(&mut out, data, ui_state, &mut rows, &mut current_row)?;
                 }
                 SectionId::Network => Self::render_network(&mut out, data)?,
                 SectionId::FileDescriptors => Self::render_fd_info(&mut out, data)?,
@@ -250,54 +245,36 @@ impl Presenter {
 
 
 
-    fn render_cpu_processes(
+    fn render_processes(
         out: &mut impl Write, data: &MonitorData, ui_state: &UIState,
         rows: &mut Vec<(Pid, RowKind)>, current_row: &mut usize,
     ) -> io::Result<()> {
-        Self::writeln(out, &format!("  {:<18} {:<10} {:<12} {}",
-            "PID[CHILDREN]", "CPU %", "MEM (MB)", "Name"))?;
+        Self::writeln(out, &format!("  {:<18} {:<8} {:<10} {:<10} {:<10} {}",
+            "PID[CHILDREN]", "CPU %", "MEM (MB)", "READ/s", "WRITE/s", "Name"))?;
+            
         for g in &data.historical_top {
             let pid_label = format!("{}[{}]", g.pid, g.child_count);
             let mem_mb = g.mem as f64 / 1_048_576.0;
-            let line = format!("  {:<18} {:<10.2} {:<12.2} {}", pid_label, g.cpu, mem_mb, g.name);
-            Self::write_selectable(out, &line, *current_row == ui_state.selected_index)?;
-            rows.push((g.pid, RowKind::CpuParent));
-            *current_row += 1;
-
-            if ui_state.cpu_expanded_pids.contains(&g.pid) {
-                for child in &g.children {
-                    let child_line = format!("    {:<16} {:<10.2} {:<12.2} {}",
-                        child.pid, child.cpu, child.mem as f64 / 1_048_576.0, child.name);
-                    Self::write_selectable(out, &child_line, *current_row == ui_state.selected_index)?;
-                    rows.push((child.pid, RowKind::CpuChild));
-                    *current_row += 1;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn render_disk_io(
-        out: &mut impl Write, data: &MonitorData, ui_state: &UIState,
-        rows: &mut Vec<(Pid, RowKind)>, current_row: &mut usize,
-    ) -> io::Result<()> {
-        Self::writeln(out, &format!("  {:<18} {:<12} {:<12} {}",
-            "PID[CHILDREN]", "READ/s", "WRITE/s", "Name"))?;
-        for g in &data.historical_disk_top {
-            let pid_label = format!("{}[{}]", g.pid, g.child_count);
             let read_fmt = Self::format_bytes_rate(g.read_bytes);
             let write_fmt = Self::format_bytes_rate(g.written_bytes);
-            let line = format!("  {:<18} {:<12} {:<12} {}", pid_label, read_fmt, write_fmt, g.name);
+            
+            let line = format!("  {:<18} {:<8.1} {:<10.1} {:<10} {:<10} {}", 
+                pid_label, g.cpu, mem_mb, read_fmt, write_fmt, g.name);
+                
             Self::write_selectable(out, &line, *current_row == ui_state.selected_index)?;
-            rows.push((g.pid, RowKind::DiskParent));
+            rows.push((g.pid, RowKind::ProcessParent));
             *current_row += 1;
 
-            if ui_state.disk_expanded_pids.contains(&g.pid) {
+            if ui_state.expanded_pids.contains(&g.pid) {
                 for child in &g.children {
-                    let child_line = format!("    {:<16} {:<12} {:<12} {}",
-                        child.pid, "N/A", "N/A", child.name);
+                    let child_read = Self::format_bytes_rate(child.read_bytes);
+                    let child_write = Self::format_bytes_rate(child.written_bytes);
+                    let child_line = format!("    {:<16} {:<8.1} {:<10.1} {:<10} {:<10} {}",
+                        child.pid, child.cpu, child.mem as f64 / 1_048_576.0, 
+                        child_read, child_write, child.name);
+                        
                     Self::write_selectable(out, &child_line, *current_row == ui_state.selected_index)?;
-                    rows.push((child.pid, RowKind::DiskChild));
+                    rows.push((child.pid, RowKind::ProcessChild));
                     *current_row += 1;
                 }
             }

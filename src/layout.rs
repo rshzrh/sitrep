@@ -3,8 +3,7 @@ use std::fmt;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SectionId {
     Summary,
-    CpuProcesses,
-    DiskIo,
+    Processes,
     Network,
     FileDescriptors,
     SocketOverview,
@@ -14,8 +13,7 @@ impl fmt::Display for SectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SectionId::Summary => write!(f, "System Summary"),
-            SectionId::CpuProcesses => write!(f, "Top 5 CPU Processes (Past 1 Minute)"),
-            SectionId::DiskIo => write!(f, "Top 5 Disk I/O Processes (Past 1 Minute)"),
+            SectionId::Processes => write!(f, "Top Processes (CPU & I/O)"),
             SectionId::Network => write!(f, "Network & Bandwidth"),
             SectionId::FileDescriptors => write!(f, "File Descriptor Details"),
             SectionId::SocketOverview => write!(f, "Socket Details"),
@@ -54,8 +52,7 @@ impl Layout {
         Self {
             sections: vec![
                 SectionLayout::new(SectionId::Summary),
-                SectionLayout::new(SectionId::CpuProcesses),
-                SectionLayout::new(SectionId::DiskIo),
+                SectionLayout::new(SectionId::Processes),
                 SectionLayout::new(SectionId::Network),
                 SectionLayout::new(SectionId::FileDescriptors).collapsed(),
                 SectionLayout::new(SectionId::SocketOverview).collapsed(),

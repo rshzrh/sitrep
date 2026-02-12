@@ -71,12 +71,8 @@ fn main() -> io::Result<()> {
                                         needs_render = true;
                                     }
                                 }
-                                RowKind::CpuParent => {
-                                    monitor.ui_state.cpu_expanded_pids.insert(pid);
-                                    needs_render = true;
-                                }
-                                RowKind::DiskParent => {
-                                    monitor.ui_state.disk_expanded_pids.insert(pid);
+                                RowKind::ProcessParent => {
+                                    monitor.ui_state.expanded_pids.insert(pid);
                                     needs_render = true;
                                 }
                                 _ => {}
@@ -94,33 +90,17 @@ fn main() -> io::Result<()> {
                                         needs_render = true;
                                     }
                                 }
-                                RowKind::CpuParent => {
-                                    monitor.ui_state.cpu_expanded_pids.remove(&pid);
+                                RowKind::ProcessParent => {
+                                    monitor.ui_state.expanded_pids.remove(&pid);
                                     needs_render = true;
                                 }
-                                RowKind::DiskParent => {
-                                    monitor.ui_state.disk_expanded_pids.remove(&pid);
-                                    needs_render = true;
-                                }
-                                RowKind::CpuChild => {
+                                RowKind::ProcessChild => {
                                     // Find parent and collapse
                                     let mut idx = monitor.ui_state.selected_index;
                                     while idx > 0 {
                                         idx -= 1;
-                                        if row_mapping[idx].1 == RowKind::CpuParent {
-                                            monitor.ui_state.cpu_expanded_pids.remove(&row_mapping[idx].0);
-                                            monitor.ui_state.selected_index = idx;
-                                            needs_render = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                RowKind::DiskChild => {
-                                    let mut idx = monitor.ui_state.selected_index;
-                                    while idx > 0 {
-                                        idx -= 1;
-                                        if row_mapping[idx].1 == RowKind::DiskParent {
-                                            monitor.ui_state.disk_expanded_pids.remove(&row_mapping[idx].0);
+                                        if row_mapping[idx].1 == RowKind::ProcessParent {
+                                            monitor.ui_state.expanded_pids.remove(&row_mapping[idx].0);
                                             monitor.ui_state.selected_index = idx;
                                             needs_render = true;
                                             break;
