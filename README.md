@@ -42,6 +42,18 @@ cargo build --release
 ./target/release/sitrep
 ```
 
+### Testing on Linux (via Docker)
+
+Since `sitrep` uses OS-specific APIs (procfs on Linux), you can verify the Linux build using Docker:
+
+```bash
+# Build the Docker image (compiles sitrep for Linux)
+docker build -t sitrep-linux .
+
+# Run the container (verifies startup and data collection)
+docker run --rm -it sitrep-linux
+```
+
 ## Usage
 
 ```bash
