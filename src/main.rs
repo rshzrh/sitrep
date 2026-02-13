@@ -1,9 +1,11 @@
-mod model;
-mod view;
-mod controller;
-mod layout;
+pub mod model;
+pub mod view;
+pub mod controller;
+pub mod layout;
+pub mod collectors;
 
 use std::io;
+use std::error::Error;
 use std::time::{Duration, Instant};
 use crossterm::{
     execute,
