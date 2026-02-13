@@ -94,11 +94,11 @@ MVC architecture with a reusable `Layout` system for defining report sections.
 
 The #1 priority. `sitrep` currently uses macOS-specific system commands (`iostat`, `netstat`, `lsof`, `sysctl`). Linux support requires platform-aware backends:
 
-- [ ] **Platform abstraction layer** — introduce a trait-based backend so each collector (disk I/O, FDs, sockets, context switches) dispatches to OS-specific implementations at compile time via `#[cfg(target_os)]`
-- [ ] **Linux: Disk I/O busy %** — read from `/proc/diskstats` or `/sys/block/*/stat` instead of `iostat`
-- [ ] **Linux: File descriptors** — read `/proc/sys/fs/file-nr` for system-wide FD counts instead of `sysctl kern.maxfiles`; use `/proc/<pid>/fd` for per-process counts instead of `lsof`
-- [ ] **Linux: Connection counts & socket overview** — parse `/proc/net/tcp` and `/proc/net/tcp6`, or use `ss -s` instead of `netstat`
-- [ ] **Linux: Context switches** — read `/proc/<pid>/status` (`voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches`) instead of `ps -eo comm,nivcsw`
+- [x] **Platform abstraction layer** — introduce a trait-based backend so each collector (disk I/O, FDs, sockets, context switches) dispatches to OS-specific implementations at compile time via `#[cfg(target_os)]`
+- [x] **Linux: Disk I/O busy %** — read from `/proc/diskstats` or `/sys/block/*/stat` instead of `iostat`
+- [x] **Linux: File descriptors** — read `/proc/sys/fs/file-nr` for system-wide FD counts instead of `sysctl kern.maxfiles`; use `/proc/<pid>/fd` for per-process counts instead of `lsof`
+- [x] **Linux: Connection counts & socket overview** — parse `/proc/net/tcp` and `/proc/net/tcp6`, or use `ss -s` instead of `netstat`
+- [x] **Linux: Context switches** — read `/proc/<pid>/status` (`voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches`) instead of `ps -eo comm,nivcsw`
 - [ ] **Linux: Top bandwidth processes** — use `/proc/net/dev` + `/proc/<pid>/net/dev` or integrate `nethogs`-style accounting instead of `lsof -i`
 - [ ] **CI matrix** — add GitHub Actions builds for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` alongside macOS
 
