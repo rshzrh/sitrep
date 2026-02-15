@@ -90,17 +90,19 @@ impl Presenter {
         ui_state: &crate::model::SwarmUIState,
         warnings: &[String],
         status_message: &Option<String>,
+        service_tasks: &std::collections::HashMap<String, Vec<crate::model::SwarmTaskInfo>>,
     ) -> io::Result<()> {
-        swarm::render_swarm_overview(cluster_info, nodes, stacks, services, ui_state, warnings, status_message)
+        swarm::render_swarm_overview(cluster_info, nodes, stacks, services, ui_state, warnings, status_message, service_tasks)
     }
 
     pub fn render_swarm_tasks(
         service_name: &str,
         tasks: &[crate::model::SwarmTaskInfo],
+        nodes: &[crate::model::SwarmNodeInfo],
         selected_index: usize,
         status_message: &Option<String>,
     ) -> io::Result<()> {
-        swarm::render_swarm_tasks(service_name, tasks, selected_index, status_message)
+        swarm::render_swarm_tasks(service_name, tasks, nodes, selected_index, status_message)
     }
 
     pub fn render_service_logs(log_state: &crate::model::ServiceLogState) -> io::Result<()> {

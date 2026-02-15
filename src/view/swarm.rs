@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write, stdout};
 use crossterm::{cursor, queue, style::{Color, SetForegroundColor, ResetColor, SetAttribute, Attribute}};
 
@@ -25,6 +26,7 @@ pub fn render_swarm_overview(
     ui_state: &SwarmUIState,
     warnings: &[String],
     status_message: &Option<String>,
+    service_tasks: &HashMap<String, Vec<SwarmTaskInfo>>,
 ) -> io::Result<()> {
     let mut out = stdout();
     queue!(out, cursor::MoveTo(0, 2))?;
@@ -64,8 +66,8 @@ pub fn render_swarm_overview(
 
     if nodes_expanded {
         queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
-        write!(out, "    {:<14} {:<20} {:<10} {:<12} {:<14} {}\r\n",
-            "ID", "HOSTNAME", "STATUS", "AVAIL", "ROLE", "ENGINE")?;
+        write!(out, "    {:<14} {:<20} {:<16} {:<10} {:<12} {:<14} {}\r\n",
+            "ID", "HOSTNAME", "IP", "STATUS", "AVAIL", "ROLE", "ENGINE")?;
         queue!(io::stdout(), ResetColor)?;
 
         for node in nodes {
@@ -75,9 +77,11 @@ pub fn render_swarm_overview(
                 "worker"
             };
             let self_marker = if node.is_self { " *" } else { "" };
-            let line = format!("    {:<14} {:<20} {:<10} {:<12} {:<14} {}{}",
+            let ip_display = if node.ip_address.is_empty() { "—" } else { &node.ip_address };
+            let line = format!("    {:<14} {:<20} {:<16} {:<10} {:<12} {:<14} {}{}",
                 truncate_str(&node.id, 12),
                 truncate_str(&node.hostname, 18),
+                truncate_str(ip_display, 15),
                 &node.status,
                 &node.availability,
                 role,
@@ -114,6 +118,12 @@ pub fn render_swarm_overview(
                 "ID", "NAME", "MODE", "REPLICAS", "IMAGE", "PORTS")?;
             queue!(io::stdout(), ResetColor)?;
 
+            // Build hostname -> IP lookup from nodes
+            let node_ip_map: HashMap<&str, &str> = nodes.iter()
+                .filter(|n| !n.ip_address.is_empty())
+                .map(|n| (n.hostname.as_str(), n.ip_address.as_str()))
+                .collect();
+
             for &idx in &stack.service_indices {
                 let svc = &services[idx];
                 let line = format!("    {:<14} {:<28} {:<12} {:<10} {:<20} {}",
@@ -132,6 +142,30 @@ pub fn render_swarm_overview(
                 write_selectable(&mut out, &line, row_idx == ui_state.selected_index)?;
                 queue!(io::stdout(), ResetColor)?;
                 row_idx += 1;
+
+                // Render inline replica sub-rows (non-selectable)
+                if let Some(tasks) = service_tasks.get(&svc.id) {
+                    for task in tasks {
+                        // Extract short name: strip the service name prefix, keep ".N" suffix
+                        let short_name = if let Some(dot_pos) = task.name.rfind('.') {
+                            &task.name[dot_pos..]
+                        } else {
+                            &task.name
+                        };
+                        let node_ip = node_ip_map.get(task.node.as_str()).copied().unwrap_or("—");
+
+                        let sub_line = format!("                       └ {:<20} {:<18} {:<16} {}",
+                            short_name,
+                            truncate_str(&task.node, 16),
+                            truncate_str(node_ip, 14),
+                            truncate_str(&task.current_state, 24),
+                        );
+
+                        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+                        writeln(&mut out, &sub_line)?;
+                        queue!(io::stdout(), ResetColor)?;
+                    }
+                }
             }
         }
     }
@@ -160,6 +194,7 @@ pub fn render_swarm_overview(
 pub fn render_swarm_tasks(
     service_name: &str,
     tasks: &[SwarmTaskInfo],
+    nodes: &[SwarmNodeInfo],
     selected_index: usize,
     status_message: &Option<String>,
 ) -> io::Result<()> {
@@ -167,6 +202,12 @@ pub fn render_swarm_tasks(
     queue!(out, cursor::MoveTo(0, 2))?;
 
     let size = crossterm::terminal::size()?;
+
+    // Build hostname -> IP lookup
+    let node_ip_map: HashMap<&str, &str> = nodes.iter()
+        .filter(|n| !n.ip_address.is_empty())
+        .map(|n| (n.hostname.as_str(), n.ip_address.as_str()))
+        .collect();
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
     writeln(&mut out, &format!("  Swarm › Tasks: {}", service_name))?;
@@ -177,15 +218,17 @@ pub fn render_swarm_tasks(
         writeln(&mut out, "  No tasks found for this service.")?;
     } else {
         queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
-        write!(out, "  {:<14} {:<28} {:<18} {:<12} {:<24} {}\r\n",
-            "ID", "NAME", "NODE", "DESIRED", "CURRENT STATE", "ERROR")?;
+        write!(out, "  {:<14} {:<28} {:<18} {:<16} {:<12} {:<24} {}\r\n",
+            "ID", "NAME", "NODE", "IP", "DESIRED", "CURRENT STATE", "ERROR")?;
         queue!(io::stdout(), ResetColor)?;
 
         for (idx, task) in tasks.iter().enumerate() {
-            let line = format!("  {:<14} {:<28} {:<18} {:<12} {:<24} {}",
+            let node_ip = node_ip_map.get(task.node.as_str()).copied().unwrap_or("—");
+            let line = format!("  {:<14} {:<28} {:<18} {:<16} {:<12} {:<24} {}",
                 truncate_str(&task.id, 12),
                 truncate_str(&task.name, 26),
                 truncate_str(&task.node, 16),
+                truncate_str(node_ip, 14),
                 &task.desired_state,
                 truncate_str(&task.current_state, 22),
                 truncate_str(&task.error, 30),

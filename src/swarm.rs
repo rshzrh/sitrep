@@ -116,6 +116,46 @@ pub fn list_nodes() -> Result<Vec<SwarmNodeInfo>, String> {
         .collect())
 }
 
+/// Batch-fetch IP addresses for all nodes in a single `docker node inspect` call.
+/// Returns a map of node ID → IP address.
+pub fn batch_get_node_ips(nodes: &[SwarmNodeInfo]) -> HashMap<String, String> {
+    let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut args = vec![
+        "node".to_string(),
+        "inspect".to_string(),
+        "--format".to_string(),
+        "{{.ID}} {{.Status.Addr}}".to_string(),
+    ];
+    for id in &ids {
+        args.push(id.to_string());
+    }
+
+    let output = match Command::new("docker").args(&args).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut result = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((id, ip)) = line.split_once(' ') {
+            let ip = ip.trim();
+            if !ip.is_empty() {
+                result.insert(id.to_string(), ip.to_string());
+            }
+        }
+    }
+    result
+}
+
 /// List all services in the Swarm.
 /// Uses a single batch `docker service inspect` to get stack labels for all services.
 pub fn list_services() -> Result<Vec<SwarmServiceInfo>, String> {
@@ -206,6 +246,36 @@ fn batch_get_stack_labels(services: &[SwarmServiceInfo]) -> HashMap<String, Stri
         }
     }
     result
+}
+
+/// Batch-fetch tasks for multiple services in a single subprocess call.
+/// Returns all tasks with `DesiredState == "Running"`.
+pub fn list_tasks_for_services(service_ids: &[&str]) -> Result<Vec<SwarmTaskInfo>, String> {
+    if service_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut args = vec!["service", "ps", "--format", "{{json .}}", "--filter", "desired-state=running"];
+    for id in service_ids {
+        args.push(id);
+    }
+
+    let output = Command::new("docker")
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to run docker service ps: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("docker service ps failed: {}", stderr));
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect())
 }
 
 /// List tasks (replicas) for a specific service.

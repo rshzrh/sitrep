@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
@@ -17,6 +18,8 @@ pub struct SwarmMonitor {
     pub services: Vec<SwarmServiceInfo>,
     pub stacks: Vec<SwarmStackInfo>,
     pub tasks: Vec<SwarmTaskInfo>,
+    /// Per-service running tasks, keyed by service ID (for inline replica sub-rows).
+    pub service_tasks: HashMap<String, Vec<SwarmTaskInfo>>,
     pub ui_state: SwarmUIState,
     pub log_state: Option<ServiceLogState>,
     log_handle: Option<LogStreamHandle>,
@@ -50,6 +53,7 @@ impl SwarmMonitor {
             services: Vec::new(),
             stacks: Vec::new(),
             tasks: Vec::new(),
+            service_tasks: HashMap::new(),
             ui_state: SwarmUIState::default(),
             log_state: None,
             log_handle: None,
@@ -78,6 +82,7 @@ impl SwarmMonitor {
             services,
             stacks,
             tasks: Vec::new(),
+            service_tasks: HashMap::new(),
             ui_state,
             log_state: None,
             log_handle: None,
@@ -115,7 +120,15 @@ impl SwarmMonitor {
         }
 
         match swarm::list_nodes() {
-            Ok(nodes) => self.nodes = nodes,
+            Ok(mut nodes) => {
+                let ips = swarm::batch_get_node_ips(&nodes);
+                for node in &mut nodes {
+                    if let Some(ip) = ips.get(&node.id) {
+                        node.ip_address = ip.clone();
+                    }
+                }
+                self.nodes = nodes;
+            }
             Err(e) => {
                 self.status_message = Some(format!("Error: {}", e));
             }
@@ -137,6 +150,54 @@ impl SwarmMonitor {
                 Ok(tasks) => self.tasks = tasks,
                 Err(e) => {
                     self.status_message = Some(format!("Error: {}", e));
+                }
+            }
+        }
+
+        // Fetch running tasks for services in expanded stacks (for inline replica sub-rows)
+        self.service_tasks.clear();
+        if !self.ui_state.expanded_ids.is_empty() {
+            // Collect service IDs from expanded stacks
+            let mut svc_ids: Vec<String> = Vec::new();
+            for stack in &self.stacks {
+                if self.ui_state.expanded_ids.contains(&stack.name) {
+                    for &idx in &stack.service_indices {
+                        if let Some(svc) = self.services.get(idx) {
+                            svc_ids.push(svc.id.clone());
+                        }
+                    }
+                }
+            }
+
+            if !svc_ids.is_empty() {
+                let id_refs: Vec<&str> = svc_ids.iter().map(|s| s.as_str()).collect();
+                match swarm::list_tasks_for_services(&id_refs) {
+                    Ok(tasks) => {
+                        // Build a name->id lookup from services
+                        let name_to_id: HashMap<String, String> = self.services.iter()
+                            .map(|s| (s.name.clone(), s.id.clone()))
+                            .collect();
+
+                        // Group tasks by service ID
+                        for task in tasks {
+                            // Task name is e.g. "stack_service.1", extract service name
+                            // by stripping the last ".N" suffix
+                            let svc_name = if let Some(dot_pos) = task.name.rfind('.') {
+                                &task.name[..dot_pos]
+                            } else {
+                                &task.name
+                            };
+                            if let Some(svc_id) = name_to_id.get(svc_name) {
+                                self.service_tasks
+                                    .entry(svc_id.clone())
+                                    .or_insert_with(Vec::new)
+                                    .push(task);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Task fetch error: {}", e));
+                    }
                 }
             }
         }

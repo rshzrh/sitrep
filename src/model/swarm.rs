@@ -39,6 +39,9 @@ pub struct SwarmNodeInfo {
     #[serde(rename = "Self")]
     #[serde(default)]
     pub is_self: bool,
+    /// IP address from `docker node inspect` (populated after list_nodes).
+    #[serde(skip)]
+    pub ip_address: String,
 }
 
 /// A Swarm service

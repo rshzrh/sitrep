@@ -81,12 +81,14 @@ pub fn render(app: &mut App) -> io::Result<()> {
                         &app.swarm_monitor.ui_state,
                         &app.swarm_monitor.warnings,
                         &app.swarm_monitor.status_message,
+                        &app.swarm_monitor.service_tasks,
                     )?;
                 }
                 SwarmViewLevel::ServiceTasks(_, name) => {
                     Presenter::render_swarm_tasks(
                         name,
                         &app.swarm_monitor.tasks,
+                        &app.swarm_monitor.nodes,
                         app.swarm_monitor.ui_state.selected_index,
                         &app.swarm_monitor.status_message,
                     )?;
