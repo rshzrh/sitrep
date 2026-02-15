@@ -61,6 +61,34 @@ impl SwarmMonitor {
         }
     }
 
+    /// Build a minimal SwarmMonitor for unit testing (no I/O).
+    #[cfg(test)]
+    pub fn new_minimal(
+        nodes: Vec<SwarmNodeInfo>,
+        services: Vec<SwarmServiceInfo>,
+        stacks: Vec<SwarmStackInfo>,
+        expanded_ids: std::collections::HashSet<String>,
+    ) -> Self {
+        let mut ui_state = SwarmUIState::default();
+        ui_state.expanded_ids = expanded_ids;
+        Self {
+            mode: SwarmMode::Swarm,
+            cluster_info: None,
+            nodes,
+            services,
+            stacks,
+            tasks: Vec::new(),
+            ui_state,
+            log_state: None,
+            log_handle: None,
+            status_message: None,
+            warnings: Vec::new(),
+            docker_cli_available: false,
+            action_receiver: None,
+            action_in_progress: false,
+        }
+    }
+
     pub fn is_swarm(&self) -> bool {
         self.mode == SwarmMode::Swarm
     }

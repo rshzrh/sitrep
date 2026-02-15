@@ -11,3 +11,4 @@ pub mod docker;
 pub mod docker_controller;
 pub mod swarm;
 pub mod swarm_controller;
+pub mod app;
