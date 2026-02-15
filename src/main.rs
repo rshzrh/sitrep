@@ -5,6 +5,8 @@ pub mod layout;
 pub mod collectors;
 pub mod docker;
 pub mod docker_controller;
+pub mod swarm;
+pub mod swarm_controller;
 
 use std::io;
 use std::sync::Arc;
@@ -16,7 +18,8 @@ use crossterm::{
 };
 use controller::Monitor;
 use docker_controller::DockerMonitor;
-use model::{AppView, SortColumn};
+use swarm_controller::SwarmMonitor;
+use model::{AppView, SortColumn, SwarmViewLevel};
 use view::{Presenter, RowKind};
 use sysinfo::Pid;
 
@@ -36,22 +39,44 @@ fn main() -> io::Result<()> {
 
     let mut monitor = Monitor::new();
     let mut docker_monitor = DockerMonitor::new(Arc::clone(&rt));
+    let mut swarm_monitor = SwarmMonitor::new();
 
     let tick_rate = Duration::from_secs(3);
     let mut last_tick = Instant::now() - tick_rate;
     let mut row_mapping: Vec<(Pid, RowKind)> = Vec::new();
     let mut needs_render = true;
     let mut app_view = AppView::System;
+    let mut tick_counter: u64 = 0; // counts 3s ticks
 
     loop {
         let now = Instant::now();
 
         // --- Tick-based data refresh (every 3 seconds) ---
         if now.duration_since(last_tick) >= tick_rate {
-            monitor.update();
-            if docker_monitor.is_available() {
-                docker_monitor.update();
+            tick_counter += 1;
+
+            // Only update the active view's monitor to avoid wasted work
+            match &app_view {
+                AppView::System => {
+                    monitor.update();
+                }
+                AppView::Containers | AppView::ContainerLogs(_) => {
+                    if docker_monitor.is_available() {
+                        docker_monitor.update();
+                    }
+                }
+                AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
+                    if swarm_monitor.is_swarm() {
+                        swarm_monitor.update();
+                    }
+                }
             }
+
+            // Re-detect swarm mode every ~30 seconds (10 ticks) when standalone
+            if !swarm_monitor.is_swarm() && tick_counter % 10 == 0 {
+                swarm_monitor.recheck_swarm();
+            }
+
             last_tick = now;
             needs_render = true;
         }
@@ -67,6 +92,16 @@ fn main() -> io::Result<()> {
                 needs_render = true;
             }
         }
+        if matches!(app_view, AppView::SwarmServiceLogs(_, _)) {
+            let had_lines = swarm_monitor.log_state.as_ref()
+                .map(|s| s.lines.len()).unwrap_or(0);
+            swarm_monitor.poll_logs();
+            let has_lines = swarm_monitor.log_state.as_ref()
+                .map(|s| s.lines.len()).unwrap_or(0);
+            if has_lines != had_lines {
+                needs_render = true;
+            }
+        }
 
         // --- Render ---
         if needs_render {
@@ -74,15 +109,19 @@ fn main() -> io::Result<()> {
                 .map(|d| d.time.clone())
                 .unwrap_or_else(|| "...".to_string());
 
+            let swarm_active = swarm_monitor.is_swarm();
+            let swarm_node_count = swarm_monitor.cluster_info.as_ref()
+                .map(|c| c.nodes_total).unwrap_or(0);
+
             match &app_view {
                 AppView::System => {
                     let mut out = io::stdout();
                     execute!(out, Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
                     Presenter::render_tab_bar(
-                        &mut out,
-                        &app_view,
+                        &mut out, &app_view,
                         docker_monitor.is_available(),
                         docker_monitor.containers.len(),
+                        swarm_active, swarm_node_count,
                         &time_str,
                     )?;
                     if let Some(ref data) = monitor.last_data {
@@ -93,10 +132,10 @@ fn main() -> io::Result<()> {
                     let mut out = io::stdout();
                     execute!(out, Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
                     Presenter::render_tab_bar(
-                        &mut out,
-                        &app_view,
+                        &mut out, &app_view,
                         docker_monitor.is_available(),
                         docker_monitor.containers.len(),
+                        swarm_active, swarm_node_count,
                         &time_str,
                     )?;
                     Presenter::render_containers(
@@ -108,6 +147,46 @@ fn main() -> io::Result<()> {
                 AppView::ContainerLogs(_) => {
                     if let Some(ref log_state) = docker_monitor.log_state {
                         Presenter::render_logs(log_state)?;
+                    }
+                }
+                AppView::Swarm | AppView::SwarmServiceTasks(_, _) => {
+                    let mut out = io::stdout();
+                    execute!(out, Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
+                    Presenter::render_tab_bar(
+                        &mut out, &app_view,
+                        docker_monitor.is_available(),
+                        docker_monitor.containers.len(),
+                        swarm_active, swarm_node_count,
+                        &time_str,
+                    )?;
+                    match &swarm_monitor.ui_state.view_level {
+                        SwarmViewLevel::Overview => {
+                            Presenter::render_swarm_overview(
+                                &swarm_monitor.cluster_info,
+                                &swarm_monitor.nodes,
+                                &swarm_monitor.stacks,
+                                &swarm_monitor.services,
+                                &swarm_monitor.ui_state,
+                                &swarm_monitor.warnings,
+                                &swarm_monitor.status_message,
+                            )?;
+                        }
+                        SwarmViewLevel::ServiceTasks(_, name) => {
+                            Presenter::render_swarm_tasks(
+                                name,
+                                &swarm_monitor.tasks,
+                                swarm_monitor.ui_state.selected_index,
+                                &swarm_monitor.status_message,
+                            )?;
+                        }
+                        SwarmViewLevel::ServiceLogs(_, _) => {
+                            // Handled below
+                        }
+                    }
+                }
+                AppView::SwarmServiceLogs(_, _) => {
+                    if let Some(ref log_state) = swarm_monitor.log_state {
+                        Presenter::render_service_logs(log_state)?;
                     }
                 }
             }
@@ -123,6 +202,54 @@ fn main() -> io::Result<()> {
                     break;
                 }
 
+                // Helper: compute next/prev tab
+                let next_tab = |current: &AppView| -> AppView {
+                    match current {
+                        AppView::System => {
+                            if docker_monitor.is_available() {
+                                AppView::Containers
+                            } else if swarm_monitor.is_swarm() {
+                                AppView::Swarm
+                            } else {
+                                AppView::System
+                            }
+                        }
+                        AppView::Containers | AppView::ContainerLogs(_) => {
+                            if swarm_monitor.is_swarm() {
+                                AppView::Swarm
+                            } else {
+                                AppView::System
+                            }
+                        }
+                        AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
+                            AppView::System
+                        }
+                    }
+                };
+                let prev_tab = |current: &AppView| -> AppView {
+                    match current {
+                        AppView::System => {
+                            if swarm_monitor.is_swarm() {
+                                AppView::Swarm
+                            } else if docker_monitor.is_available() {
+                                AppView::Containers
+                            } else {
+                                AppView::System
+                            }
+                        }
+                        AppView::Containers | AppView::ContainerLogs(_) => {
+                            AppView::System
+                        }
+                        AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
+                            if docker_monitor.is_available() {
+                                AppView::Containers
+                            } else {
+                                AppView::System
+                            }
+                        }
+                    }
+                };
+
                 match &app_view {
                     // ==========================================================
                     // System view
@@ -131,16 +258,12 @@ fn main() -> io::Result<()> {
                         match code {
                             KeyCode::Char('q') | KeyCode::Esc => break,
                             KeyCode::Tab => {
-                                if docker_monitor.is_available() {
-                                    app_view = AppView::Containers;
-                                    needs_render = true;
-                                }
+                                app_view = next_tab(&app_view);
+                                needs_render = true;
                             }
                             KeyCode::BackTab => {
-                                if docker_monitor.is_available() {
-                                    app_view = AppView::Containers;
-                                    needs_render = true;
-                                }
+                                app_view = prev_tab(&app_view);
+                                needs_render = true;
                             }
                             KeyCode::Up => {
                                 if monitor.ui_state.selected_index > 0 {
@@ -236,11 +359,11 @@ fn main() -> io::Result<()> {
                         match code {
                             KeyCode::Char('q') | KeyCode::Esc => break,
                             KeyCode::Tab => {
-                                app_view = AppView::System;
+                                app_view = next_tab(&app_view);
                                 needs_render = true;
                             }
                             KeyCode::BackTab => {
-                                app_view = AppView::System;
+                                app_view = prev_tab(&app_view);
                                 needs_render = true;
                             }
                             KeyCode::Up => {
@@ -302,10 +425,40 @@ fn main() -> io::Result<()> {
                     // Log viewer (full screen)
                     // ==========================================================
                     AppView::ContainerLogs(_) => {
+                        // Handle search mode input first
+                        if docker_monitor.log_state.as_ref().map_or(false, |s| s.search_mode) {
+                            match code {
+                                KeyCode::Enter => {
+                                    if let Some(ref mut log_state) = docker_monitor.log_state {
+                                        log_state.search_mode = false;
+                                        needs_render = true;
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    if let Some(ref mut log_state) = docker_monitor.log_state {
+                                        log_state.search_mode = false;
+                                        log_state.search_query.clear();
+                                        needs_render = true;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(ref mut log_state) = docker_monitor.log_state {
+                                        log_state.search_query.pop();
+                                        needs_render = true;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(ref mut log_state) = docker_monitor.log_state {
+                                        log_state.search_query.push(c);
+                                        needs_render = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else {
                         match code {
                             KeyCode::Char('q') => break,
                             KeyCode::Esc | KeyCode::Left => {
-                                // Go back to container list
                                 docker_monitor.stop_log_stream();
                                 app_view = AppView::Containers;
                                 needs_render = true;
@@ -338,6 +491,19 @@ fn main() -> io::Result<()> {
                                     needs_render = true;
                                 }
                             }
+                            KeyCode::Char('/') => {
+                                if let Some(ref mut log_state) = docker_monitor.log_state {
+                                    log_state.search_mode = true;
+                                    log_state.search_query.clear();
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Char('n') => {
+                                if let Some(ref mut log_state) = docker_monitor.log_state {
+                                    log_state.search_query.clear();
+                                    needs_render = true;
+                                }
+                            }
                             KeyCode::PageUp => {
                                 if let Some(ref mut log_state) = docker_monitor.log_state {
                                     log_state.auto_follow = false;
@@ -367,6 +533,258 @@ fn main() -> io::Result<()> {
                             }
                             _ => {}
                         }
+                        }
+                    }
+
+                    // ==========================================================
+                    // Swarm overview
+                    // ==========================================================
+                    AppView::Swarm => {
+                        match code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Tab => {
+                                app_view = next_tab(&app_view);
+                                needs_render = true;
+                            }
+                            KeyCode::BackTab => {
+                                app_view = prev_tab(&app_view);
+                                needs_render = true;
+                            }
+                            KeyCode::Up => {
+                                if swarm_monitor.ui_state.selected_index > 0 {
+                                    swarm_monitor.ui_state.selected_index -= 1;
+                                    swarm_monitor.status_message = None;
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Down => {
+                                let max = swarm_monitor.overview_row_count();
+                                if swarm_monitor.ui_state.selected_index + 1 < max {
+                                    swarm_monitor.ui_state.selected_index += 1;
+                                    swarm_monitor.status_message = None;
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Right => {
+                                // Determine what's at the current selection
+                                let sel = swarm_monitor.ui_state.selected_index;
+                                let item = resolve_swarm_overview_item(&swarm_monitor, sel);
+                                match item {
+                                    SwarmOverviewItem::NodesHeader => {
+                                        swarm_monitor.ui_state.expanded_ids.insert("__nodes__".to_string());
+                                        needs_render = true;
+                                    }
+                                    SwarmOverviewItem::StackHeader(name) => {
+                                        swarm_monitor.ui_state.expanded_ids.insert(name);
+                                        needs_render = true;
+                                    }
+                                    SwarmOverviewItem::Service(id, name) => {
+                                        swarm_monitor.enter_task_view(&id, &name);
+                                        app_view = AppView::SwarmServiceTasks(id, name);
+                                        needs_render = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Left => {
+                                let sel = swarm_monitor.ui_state.selected_index;
+                                let item = resolve_swarm_overview_item(&swarm_monitor, sel);
+                                match item {
+                                    SwarmOverviewItem::NodesHeader => {
+                                        swarm_monitor.ui_state.expanded_ids.remove("__nodes__");
+                                        needs_render = true;
+                                    }
+                                    SwarmOverviewItem::StackHeader(name) => {
+                                        swarm_monitor.ui_state.expanded_ids.remove(&name);
+                                        needs_render = true;
+                                    }
+                                    SwarmOverviewItem::Node => {
+                                        // Collapse nodes section and jump to header
+                                        swarm_monitor.ui_state.expanded_ids.remove("__nodes__");
+                                        swarm_monitor.ui_state.selected_index = 0;
+                                        needs_render = true;
+                                    }
+                                    SwarmOverviewItem::Service(_, _) => {
+                                        // No collapse action for individual services
+                                    }
+                                    SwarmOverviewItem::None => {}
+                                }
+                            }
+                            KeyCode::Char('R') => {
+                                // Rolling restart selected service
+                                let sel = swarm_monitor.ui_state.selected_index;
+                                let item = resolve_swarm_overview_item(&swarm_monitor, sel);
+                                if let SwarmOverviewItem::Service(id, _) = item {
+                                    swarm_monitor.force_restart_service(&id);
+                                    needs_render = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // ==========================================================
+                    // Swarm task/replica list
+                    // ==========================================================
+                    AppView::SwarmServiceTasks(_, _) => {
+                        match code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc | KeyCode::Left => {
+                                swarm_monitor.go_back();
+                                app_view = AppView::Swarm;
+                                needs_render = true;
+                            }
+                            KeyCode::Up => {
+                                if swarm_monitor.ui_state.selected_index > 0 {
+                                    swarm_monitor.ui_state.selected_index -= 1;
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if swarm_monitor.ui_state.selected_index + 1 < swarm_monitor.tasks.len() {
+                                    swarm_monitor.ui_state.selected_index += 1;
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                                // Enter service logs
+                                if let SwarmViewLevel::ServiceTasks(ref svc_id, ref svc_name) = swarm_monitor.ui_state.view_level.clone() {
+                                    swarm_monitor.start_service_log_stream(svc_id, svc_name);
+                                    app_view = AppView::SwarmServiceLogs(svc_id.clone(), svc_name.clone());
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Char('R') => {
+                                // Rolling restart
+                                if let SwarmViewLevel::ServiceTasks(ref svc_id, _) = swarm_monitor.ui_state.view_level.clone() {
+                                    swarm_monitor.force_restart_service(svc_id);
+                                    needs_render = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // ==========================================================
+                    // Service log viewer (full screen)
+                    // ==========================================================
+                    AppView::SwarmServiceLogs(_, _) => {
+                        // Handle search mode input first
+                        if swarm_monitor.log_state.as_ref().map_or(false, |s| s.search_mode) {
+                            match code {
+                                KeyCode::Enter => {
+                                    if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                        log_state.search_mode = false;
+                                        needs_render = true;
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                        log_state.search_mode = false;
+                                        log_state.search_query.clear();
+                                        needs_render = true;
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                        log_state.search_query.pop();
+                                        needs_render = true;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                        log_state.search_query.push(c);
+                                        needs_render = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else {
+                        match code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Esc | KeyCode::Left => {
+                                swarm_monitor.stop_log_stream();
+                                swarm_monitor.ui_state.view_level = SwarmViewLevel::Overview;
+                                app_view = AppView::Swarm;
+                                needs_render = true;
+                            }
+                            KeyCode::Up => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    log_state.auto_follow = false;
+                                    let max_offset = log_state.lines.len().saturating_sub(1);
+                                    if log_state.scroll_offset < max_offset {
+                                        log_state.scroll_offset += 1;
+                                    }
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    if log_state.scroll_offset > 0 {
+                                        log_state.scroll_offset -= 1;
+                                        if log_state.scroll_offset == 0 {
+                                            log_state.auto_follow = true;
+                                        }
+                                    }
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Char('f') | KeyCode::End => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    log_state.auto_follow = true;
+                                    log_state.scroll_offset = 0;
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Char('e') => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    log_state.filter_errors = !log_state.filter_errors;
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Char('/') => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    log_state.search_mode = true;
+                                    log_state.search_query.clear();
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::Char('n') => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    log_state.search_query.clear();
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    log_state.auto_follow = false;
+                                    let page_size = crossterm::terminal::size()
+                                        .map(|(_, h)| h as usize)
+                                        .unwrap_or(24)
+                                        .saturating_sub(4);
+                                    let max_offset = log_state.lines.len().saturating_sub(1);
+                                    log_state.scroll_offset = (log_state.scroll_offset + page_size).min(max_offset);
+                                    needs_render = true;
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if let Some(ref mut log_state) = swarm_monitor.log_state {
+                                    let page_size = crossterm::terminal::size()
+                                        .map(|(_, h)| h as usize)
+                                        .unwrap_or(24)
+                                        .saturating_sub(4);
+                                    if log_state.scroll_offset > page_size {
+                                        log_state.scroll_offset -= page_size;
+                                    } else {
+                                        log_state.scroll_offset = 0;
+                                        log_state.auto_follow = true;
+                                    }
+                                    needs_render = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                        }
                     }
                 }
             }
@@ -376,4 +794,57 @@ fn main() -> io::Result<()> {
     execute!(stdout, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
+}
+
+/// What kind of item is at a given row index in the Swarm overview
+enum SwarmOverviewItem {
+    NodesHeader,
+    Node,
+    StackHeader(String),
+    Service(String, String), // (service_id, service_name)
+    None,
+}
+
+/// Resolve which item is at the given row index in the Swarm overview.
+fn resolve_swarm_overview_item(
+    monitor: &SwarmMonitor,
+    selected: usize,
+) -> SwarmOverviewItem {
+    let mut row_idx: usize = 0;
+
+    // Nodes header
+    if selected == row_idx {
+        return SwarmOverviewItem::NodesHeader;
+    }
+    row_idx += 1;
+
+    // Nodes (if expanded)
+    if monitor.ui_state.expanded_ids.contains("__nodes__") {
+        for _node in &monitor.nodes {
+            if selected == row_idx {
+                return SwarmOverviewItem::Node;
+            }
+            row_idx += 1;
+        }
+    }
+
+    // Stacks
+    for stack in &monitor.stacks {
+        if selected == row_idx {
+            return SwarmOverviewItem::StackHeader(stack.name.clone());
+        }
+        row_idx += 1;
+
+        if monitor.ui_state.expanded_ids.contains(&stack.name) {
+            for &idx in &stack.service_indices {
+                if selected == row_idx {
+                    let svc = &monitor.services[idx];
+                    return SwarmOverviewItem::Service(svc.id.clone(), svc.name.clone());
+                }
+                row_idx += 1;
+            }
+        }
+    }
+
+    SwarmOverviewItem::None
 }

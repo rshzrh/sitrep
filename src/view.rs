@@ -1,4 +1,8 @@
-use crate::model::{MonitorData, UIState, AppView, DockerContainerInfo, ContainerUIState, LogViewState};
+use crate::model::{
+    MonitorData, UIState, AppView, DockerContainerInfo, ContainerUIState, LogViewState,
+    SwarmClusterInfo, SwarmNodeInfo, SwarmServiceInfo, SwarmStackInfo, SwarmTaskInfo,
+    SwarmUIState, ServiceLogState,
+};
 use crate::layout::{Layout, SectionId};
 use std::io::{self, Write, stdout};
 use crossterm::{
@@ -28,6 +32,8 @@ impl Presenter {
         current_view: &AppView,
         docker_available: bool,
         container_count: usize,
+        swarm_active: bool,
+        node_count: u32,
         time: &str,
     ) -> io::Result<()> {
         write!(out, "  ")?;
@@ -51,6 +57,21 @@ impl Presenter {
                 queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
             }
             write!(out, " Containers ({}) ", container_count)?;
+            queue!(io::stdout(), ResetColor)?;
+        }
+
+        if swarm_active {
+            write!(out, "  ")?;
+            let swarm_tab_active = matches!(
+                current_view,
+                AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _)
+            );
+            if swarm_tab_active {
+                queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+            } else {
+                queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+            }
+            write!(out, " Swarm ({} nodes) ", node_count)?;
             queue!(io::stdout(), ResetColor)?;
         }
 
@@ -242,8 +263,13 @@ impl Presenter {
 
         // Header
         let follow_indicator = if log_state.auto_follow { "FOLLOWING" } else { "PAUSED" };
-        let header = format!("  Logs: {} ({}) - {}",
-            log_state.container_name, log_state.container_id, follow_indicator);
+        let search_indicator = if !log_state.search_query.is_empty() {
+            format!(" | SEARCH: \"{}\"", log_state.search_query)
+        } else {
+            String::new()
+        };
+        let header = format!("  Logs: {} ({}) - {}{}",
+            log_state.container_name, log_state.container_id, follow_indicator, search_indicator);
 
         queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
         if !log_state.auto_follow {
@@ -252,21 +278,39 @@ impl Presenter {
         write!(out, "{}\r\n", header)?;
         queue!(io::stdout(), SetAttribute(Attribute::Reset), ResetColor)?;
 
-        // Separator
-        let sep: String = "─".repeat(width);
-        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
-        write!(out, "{}\r\n", sep)?;
-        queue!(io::stdout(), ResetColor)?;
+        // Search prompt line (if active)
+        if log_state.search_mode {
+            queue!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+            write!(out, "  Search: {}_\r\n", log_state.search_query)?;
+            queue!(io::stdout(), ResetColor)?;
+        } else {
+            // Separator
+            let sep: String = "─".repeat(width);
+            queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+            write!(out, "{}\r\n", sep)?;
+            queue!(io::stdout(), ResetColor)?;
+        }
 
-        // Log content area: height - 4 (header + separator + footer + blank)
+        // Log content area
         let log_area_height = height.saturating_sub(4);
-        let total_lines = log_state.lines.len();
+
+        // Filter lines by search query if set
+        let has_search = !log_state.search_query.is_empty();
+        let query_lower = log_state.search_query.to_lowercase();
+
+        let display_lines: Vec<&String> = if has_search {
+            log_state.lines.iter()
+                .filter(|l| l.to_lowercase().contains(&query_lower))
+                .collect()
+        } else {
+            log_state.lines.iter().collect()
+        };
+
+        let total_lines = display_lines.len();
 
         let start_line = if log_state.auto_follow {
-            // Show the last `log_area_height` lines
             total_lines.saturating_sub(log_area_height)
         } else {
-            // Manual scroll: scroll_offset is lines from the bottom
             let bottom_start = total_lines.saturating_sub(log_area_height);
             bottom_start.saturating_sub(log_state.scroll_offset)
         };
@@ -275,14 +319,26 @@ impl Presenter {
 
         let mut lines_printed = 0;
         for i in start_line..end_line {
-            if let Some(line) = log_state.lines.get(i) {
-                // Truncate line to terminal width
+            if let Some(line) = display_lines.get(i) {
                 let display_line = if line.len() > width {
                     &line[..width]
                 } else {
-                    line
+                    line.as_str()
                 };
-                write!(out, "{}\r\n", display_line)?;
+
+                // Highlight search matches
+                if has_search {
+                    let lower_line = display_line.to_lowercase();
+                    if lower_line.contains(&query_lower) {
+                        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                        write!(out, "{}\r\n", display_line)?;
+                        queue!(io::stdout(), ResetColor)?;
+                    } else {
+                        write!(out, "{}\r\n", display_line)?;
+                    }
+                } else {
+                    write!(out, "{}\r\n", display_line)?;
+                }
                 lines_printed += 1;
             }
         }
@@ -293,7 +349,13 @@ impl Presenter {
         }
 
         // Footer
-        let help = "Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow";
+        let help = if log_state.search_mode {
+            "Type to search | Enter: Confirm | Esc: Cancel"
+        } else if has_search {
+            "Esc/←: Back | ↑/↓: Scroll | f/End: Follow | /: Search | n: Clear search"
+        } else {
+            "Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow | /: Search"
+        };
         let help_y = (height.saturating_sub(1)) as u16;
         queue!(
             out,
@@ -305,6 +367,389 @@ impl Presenter {
 
         out.flush()?;
         Ok(())
+    }
+
+    // =====================================================================
+    // Swarm overview (nodes + stacks/services)
+    // =====================================================================
+
+    pub fn render_swarm_overview(
+        cluster_info: &Option<SwarmClusterInfo>,
+        nodes: &[SwarmNodeInfo],
+        stacks: &[SwarmStackInfo],
+        services: &[SwarmServiceInfo],
+        ui_state: &SwarmUIState,
+        warnings: &[String],
+        status_message: &Option<String>,
+    ) -> io::Result<()> {
+        let mut out = stdout();
+        queue!(out, cursor::MoveTo(0, 2))?;
+
+        let size = terminal::size()?;
+
+        // Cluster header
+        if let Some(info) = cluster_info {
+            queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+            write!(out, "  Cluster: {} nodes ({} managers) | This node: {}\r\n",
+                info.nodes_total, info.managers,
+                if info.is_manager { "manager" } else { "worker" })?;
+            queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
+        }
+        Self::writeln(&mut out, "")?;
+
+        // Warnings
+        if !warnings.is_empty() {
+            for w in warnings {
+                queue!(io::stdout(), SetForegroundColor(Color::Red), SetAttribute(Attribute::Bold))?;
+                Self::writeln(&mut out, &format!("  ⚠ {}", w))?;
+                queue!(io::stdout(), ResetColor, SetAttribute(Attribute::Reset))?;
+            }
+            Self::writeln(&mut out, "")?;
+        }
+
+        let mut row_idx: usize = 0;
+
+        // --- Nodes section ---
+        let nodes_expanded = ui_state.expanded_ids.contains("__nodes__");
+        let node_indicator = if nodes_expanded { "▼" } else { "▶" };
+        let node_header = format!("  {} NODES ({})", node_indicator, nodes.len());
+        Self::write_selectable(&mut out, &node_header,
+            row_idx == ui_state.selected_index)?;
+        row_idx += 1;
+
+        if nodes_expanded {
+            // Node column headers
+            queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+            write!(out, "    {:<14} {:<20} {:<10} {:<12} {:<14} {}\r\n",
+                "ID", "HOSTNAME", "STATUS", "AVAIL", "ROLE", "ENGINE")?;
+            queue!(io::stdout(), ResetColor)?;
+
+            for node in nodes {
+                let role = if !node.manager_status.is_empty() {
+                    &node.manager_status
+                } else {
+                    "worker"
+                };
+
+                let self_marker = if node.is_self { " *" } else { "" };
+
+                let line = format!("    {:<14} {:<20} {:<10} {:<12} {:<14} {}{}",
+                    truncate_str(&node.id, 12),
+                    truncate_str(&node.hostname, 18),
+                    &node.status,
+                    &node.availability,
+                    role,
+                    &node.engine_version,
+                    self_marker,
+                );
+
+                // Color by status
+                if node.status.to_lowercase().contains("down") {
+                    queue!(io::stdout(), SetForegroundColor(Color::Red))?;
+                } else if node.availability.to_lowercase().contains("drain") {
+                    queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                }
+
+                Self::write_selectable(&mut out, &line,
+                    row_idx == ui_state.selected_index)?;
+                queue!(io::stdout(), ResetColor)?;
+                row_idx += 1;
+            }
+        }
+
+        Self::writeln(&mut out, "")?;
+
+        // --- Stacks/Services ---
+        for stack in stacks {
+            let stack_expanded = ui_state.expanded_ids.contains(&stack.name);
+            let indicator = if stack_expanded { "▼" } else { "▶" };
+            let svc_count = stack.service_indices.len();
+            let stack_header = format!("  {} STACK: {} ({} services)", indicator, stack.name, svc_count);
+
+            Self::write_selectable(&mut out, &stack_header,
+                row_idx == ui_state.selected_index)?;
+            row_idx += 1;
+
+            if stack_expanded {
+                // Service column headers
+                queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+                write!(out, "    {:<14} {:<28} {:<12} {:<10} {:<20} {}\r\n",
+                    "ID", "NAME", "MODE", "REPLICAS", "IMAGE", "PORTS")?;
+                queue!(io::stdout(), ResetColor)?;
+
+                for &idx in &stack.service_indices {
+                    let svc = &services[idx];
+                    let line = format!("    {:<14} {:<28} {:<12} {:<10} {:<20} {}",
+                        truncate_str(&svc.id, 12),
+                        truncate_str(&svc.name, 26),
+                        &svc.mode,
+                        &svc.replicas,
+                        truncate_str(&svc.image, 18),
+                        truncate_str(&svc.ports, 20),
+                    );
+
+                    // Color degraded services
+                    let is_degraded = Self::is_replica_degraded(&svc.replicas);
+                    if is_degraded {
+                        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                    }
+
+                    Self::write_selectable(&mut out, &line,
+                        row_idx == ui_state.selected_index)?;
+                    queue!(io::stdout(), ResetColor)?;
+                    row_idx += 1;
+                }
+            }
+        }
+
+        // Status message
+        if let Some(msg) = status_message {
+            Self::writeln(&mut out, "")?;
+            queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+            Self::writeln(&mut out, &format!("  {}", msg))?;
+            queue!(io::stdout(), ResetColor)?;
+        }
+
+        // Footer
+        let help = "q: Quit | Tab: Switch | ↑/↓: Navigate | →: Expand/Drill | ←: Collapse/Back | R: Rolling Restart";
+        let help_y = size.1.saturating_sub(1);
+        queue!(
+            out,
+            MoveTo(1, help_y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{:<width$}", help, width = size.0 as usize)),
+            ResetColor
+        )?;
+
+        out.flush()?;
+        Ok(())
+    }
+
+    // =====================================================================
+    // Swarm task/replica list for a service
+    // =====================================================================
+
+    pub fn render_swarm_tasks(
+        service_name: &str,
+        tasks: &[SwarmTaskInfo],
+        selected_index: usize,
+        status_message: &Option<String>,
+    ) -> io::Result<()> {
+        let mut out = stdout();
+        queue!(out, cursor::MoveTo(0, 2))?;
+
+        let size = terminal::size()?;
+
+        // Header
+        queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+        Self::writeln(&mut out, &format!("  Service: {} — Tasks/Replicas", service_name))?;
+        queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
+        Self::writeln(&mut out, "")?;
+
+        if tasks.is_empty() {
+            Self::writeln(&mut out, "  No tasks found for this service.")?;
+        } else {
+            // Column headers
+            queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+            write!(out, "  {:<14} {:<28} {:<18} {:<12} {:<24} {}\r\n",
+                "ID", "NAME", "NODE", "DESIRED", "CURRENT STATE", "ERROR")?;
+            queue!(io::stdout(), ResetColor)?;
+
+            for (idx, task) in tasks.iter().enumerate() {
+                let line = format!("  {:<14} {:<28} {:<18} {:<12} {:<24} {}",
+                    truncate_str(&task.id, 12),
+                    truncate_str(&task.name, 26),
+                    truncate_str(&task.node, 16),
+                    &task.desired_state,
+                    truncate_str(&task.current_state, 22),
+                    truncate_str(&task.error, 30),
+                );
+
+                // Color by state
+                let state_lower = task.current_state.to_lowercase();
+                if state_lower.contains("failed") || state_lower.contains("rejected") {
+                    queue!(io::stdout(), SetForegroundColor(Color::Red))?;
+                } else if state_lower.contains("shutdown") || state_lower.contains("complete") {
+                    queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+                } else if state_lower.contains("running") {
+                    queue!(io::stdout(), SetForegroundColor(Color::Green))?;
+                }
+
+                Self::write_selectable(&mut out, &line, idx == selected_index)?;
+                queue!(io::stdout(), ResetColor)?;
+            }
+        }
+
+        // Status message
+        if let Some(msg) = status_message {
+            Self::writeln(&mut out, "")?;
+            queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+            Self::writeln(&mut out, &format!("  {}", msg))?;
+            queue!(io::stdout(), ResetColor)?;
+        }
+
+        // Footer
+        let help = "Esc/←: Back | ↑/↓: Navigate | →/L: Service Logs | R: Rolling Restart";
+        let help_y = size.1.saturating_sub(1);
+        queue!(
+            out,
+            MoveTo(1, help_y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{:<width$}", help, width = size.0 as usize)),
+            ResetColor
+        )?;
+
+        out.flush()?;
+        Ok(())
+    }
+
+    // =====================================================================
+    // Service log viewer (full-screen, like container logs)
+    // =====================================================================
+
+    pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
+        let mut out = stdout();
+        execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+
+        let size = terminal::size()?;
+        let width = size.0 as usize;
+        let height = size.1 as usize;
+
+        // Header
+        let follow_indicator = if log_state.auto_follow { "FOLLOWING" } else { "PAUSED" };
+        let filter_indicator = if log_state.filter_errors { " | ERRORS ONLY" } else { "" };
+        let search_indicator = if !log_state.search_query.is_empty() {
+            format!(" | SEARCH: \"{}\"", log_state.search_query)
+        } else {
+            String::new()
+        };
+        let header = format!("  Service Logs: {} ({}) - {}{}{}",
+            log_state.service_name, log_state.service_id, follow_indicator, filter_indicator, search_indicator);
+
+        queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+        if !log_state.auto_follow {
+            queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+        }
+        write!(out, "{}\r\n", header)?;
+        queue!(io::stdout(), SetAttribute(Attribute::Reset), ResetColor)?;
+
+        // Search prompt line (if active)
+        if log_state.search_mode {
+            queue!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+            write!(out, "  Search: {}_\r\n", log_state.search_query)?;
+            queue!(io::stdout(), ResetColor)?;
+        } else {
+            // Separator
+            let sep: String = "─".repeat(width);
+            queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+            write!(out, "{}\r\n", sep)?;
+            queue!(io::stdout(), ResetColor)?;
+        }
+
+        // Filter lines by error and/or search
+        let has_search = !log_state.search_query.is_empty();
+        let query_lower = log_state.search_query.to_lowercase();
+
+        let display_lines: Vec<&String> = log_state.lines.iter()
+            .filter(|l| {
+                if log_state.filter_errors {
+                    let lower = l.to_lowercase();
+                    if !(lower.contains("error") || lower.contains("err")
+                        || lower.contains("panic") || lower.contains("fatal")
+                        || lower.contains("exception") || lower.contains("fail")) {
+                        return false;
+                    }
+                }
+                if has_search {
+                    if !l.to_lowercase().contains(&query_lower) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        let log_area_height = height.saturating_sub(4);
+        let total_lines = display_lines.len();
+
+        let start_line = if log_state.auto_follow {
+            total_lines.saturating_sub(log_area_height)
+        } else {
+            let bottom_start = total_lines.saturating_sub(log_area_height);
+            bottom_start.saturating_sub(log_state.scroll_offset)
+        };
+
+        let end_line = (start_line + log_area_height).min(total_lines);
+
+        let mut lines_printed = 0;
+        for i in start_line..end_line {
+            if let Some(line) = display_lines.get(i) {
+                // Highlight error lines
+                let is_error = {
+                    let lower = line.to_lowercase();
+                    lower.contains("error") || lower.contains("panic")
+                        || lower.contains("fatal") || lower.contains("exception")
+                };
+
+                // Highlight search matches
+                let is_match = has_search && line.to_lowercase().contains(&query_lower);
+
+                if is_error {
+                    queue!(io::stdout(), SetForegroundColor(Color::Red))?;
+                } else if is_match {
+                    queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                }
+
+                let display_line = if line.len() > width {
+                    &line[..width]
+                } else {
+                    line
+                };
+                write!(out, "{}\r\n", display_line)?;
+
+                if is_error || is_match {
+                    queue!(io::stdout(), ResetColor)?;
+                }
+                lines_printed += 1;
+            }
+        }
+
+        for _ in lines_printed..log_area_height {
+            write!(out, "\r\n")?;
+        }
+
+        // Footer
+        let help = if log_state.search_mode {
+            "Type to search | Enter: Confirm | Esc: Cancel"
+        } else if has_search {
+            "Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Errors | /: Search | n: Clear search"
+        } else {
+            "Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Toggle Error Filter | /: Search"
+        };
+        let help_y = (height.saturating_sub(1)) as u16;
+        queue!(
+            out,
+            MoveTo(1, help_y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{:<width$}", help, width = width)),
+            ResetColor
+        )?;
+
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Helper: check if a replica string like "2/3" indicates degraded state.
+    fn is_replica_degraded(replicas: &str) -> bool {
+        if replicas.contains('/') {
+            let parts: Vec<&str> = replicas.split('/').collect();
+            if parts.len() == 2 {
+                let current: u32 = parts[0].trim().parse().unwrap_or(0);
+                let desired: u32 = parts[1].trim().parse().unwrap_or(0);
+                return desired > 0 && current < desired;
+            }
+        }
+        false
     }
 
     // --- Section renderers ---

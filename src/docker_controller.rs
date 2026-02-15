@@ -45,9 +45,11 @@ impl DockerMonitor {
 
         let mut containers = self.rt.block_on(client.list_containers());
 
-        // Fetch CPU stats for each container (one-shot, fast)
-        for c in &mut containers {
-            c.cpu_percent = self.rt.block_on(client.get_cpu_percent(&c.id));
+        // Fetch CPU stats for all containers concurrently
+        let ids: Vec<String> = containers.iter().map(|c| c.id.clone()).collect();
+        let cpu_percents = self.rt.block_on(client.get_all_cpu_percents(&ids));
+        for (c, cpu) in containers.iter_mut().zip(cpu_percents.into_iter()) {
+            c.cpu_percent = cpu;
         }
 
         self.containers = containers;

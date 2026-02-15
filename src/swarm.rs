@@ -1,0 +1,297 @@
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+
+use serde::Deserialize;
+
+use crate::model::{SwarmClusterInfo, SwarmNodeInfo, SwarmServiceInfo, SwarmTaskInfo};
+
+/// Typed struct for docker info Swarm section (avoids serde_json::Value overhead)
+#[derive(Deserialize)]
+struct DockerInfoSwarm {
+    #[serde(rename = "LocalNodeState")]
+    #[serde(default)]
+    local_node_state: String,
+    #[serde(rename = "NodeID")]
+    #[serde(default)]
+    node_id: String,
+    #[serde(rename = "NodeAddr")]
+    #[serde(default)]
+    node_addr: String,
+    #[serde(rename = "ControlAvailable")]
+    #[serde(default)]
+    control_available: bool,
+    #[serde(rename = "Managers")]
+    #[serde(default)]
+    managers: u32,
+    #[serde(rename = "Nodes")]
+    #[serde(default)]
+    nodes: u32,
+}
+
+#[derive(Deserialize)]
+struct DockerInfoPartial {
+    #[serde(rename = "Swarm")]
+    swarm: Option<DockerInfoSwarm>,
+}
+
+/// Detect whether Docker is in Swarm mode by querying `docker info`.
+/// Returns Some(SwarmClusterInfo) if swarm is active, None otherwise.
+pub fn detect_swarm() -> Option<SwarmClusterInfo> {
+    let output = Command::new("docker")
+        .args(["info", "--format", "{{json .}}"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let info: DockerInfoPartial = serde_json::from_str(text.trim()).ok()?;
+    let swarm = info.swarm?;
+
+    if swarm.local_node_state != "active" {
+        return None;
+    }
+
+    Some(SwarmClusterInfo {
+        node_id: swarm.node_id,
+        node_addr: swarm.node_addr,
+        is_manager: swarm.control_available,
+        managers: swarm.managers,
+        nodes_total: swarm.nodes,
+    })
+}
+
+/// List all nodes in the Swarm cluster.
+pub fn list_nodes() -> Vec<SwarmNodeInfo> {
+    let output = match Command::new("docker")
+        .args(["node", "ls", "--format", "{{json .}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let mut node: SwarmNodeInfo = serde_json::from_str(line).ok()?;
+            // docker node ls outputs "Self" as a bool or "*"
+            // The format template returns true/false for Self field
+            // but the JSON might show it as a string. Handle both.
+            if node.manager_status.is_empty() {
+                node.manager_status = String::new();
+            }
+            Some(node)
+        })
+        .collect()
+}
+
+/// List all services in the Swarm.
+/// Uses a single batch `docker service inspect` to get stack labels for all services.
+pub fn list_services() -> Vec<SwarmServiceInfo> {
+    let output = match Command::new("docker")
+        .args(["service", "ls", "--format", "{{json .}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut services: Vec<SwarmServiceInfo> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    if services.is_empty() {
+        return services;
+    }
+
+    // Batch: fetch all stack labels in one call
+    let stack_labels = batch_get_stack_labels(&services);
+    for svc in &mut services {
+        if let Some(label) = stack_labels.get(&svc.id) {
+            svc.stack = label.clone();
+        }
+    }
+
+    services
+}
+
+/// Batch-fetch stack labels for all services in a single `docker service inspect` call.
+fn batch_get_stack_labels(services: &[SwarmServiceInfo]) -> HashMap<String, String> {
+    let ids: Vec<&str> = services.iter().map(|s| s.id.as_str()).collect();
+    if ids.is_empty() {
+        return HashMap::new();
+    }
+
+    // Build args: docker service inspect --format '{{.ID}} {{index .Spec.Labels "com.docker.stack.namespace"}}' id1 id2 ...
+    let mut args = vec![
+        "service".to_string(),
+        "inspect".to_string(),
+        "--format".to_string(),
+        r#"{{.ID}} {{index .Spec.Labels "com.docker.stack.namespace"}}"#.to_string(),
+    ];
+    for id in &ids {
+        args.push(id.to_string());
+    }
+
+    let output = match Command::new("docker")
+        .args(&args)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut result = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "SERVICE_ID STACK_NAME" or "SERVICE_ID <no value>"
+        if let Some(space_pos) = line.find(' ') {
+            let id = &line[..space_pos];
+            let label = &line[space_pos + 1..];
+            let label = if label == "<no value>" || label.is_empty() {
+                String::new()
+            } else {
+                label.to_string()
+            };
+            // Match by short ID prefix (docker inspect returns full IDs)
+            for svc_id in &ids {
+                if id.starts_with(svc_id) || svc_id.starts_with(id) {
+                    result.insert(svc_id.to_string(), label.clone());
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+
+/// List tasks (replicas) for a specific service.
+pub fn list_service_tasks(service_id: &str) -> Vec<SwarmTaskInfo> {
+    let output = match Command::new("docker")
+        .args(["service", "ps", service_id, "--format", "{{json .}}", "--no-trunc"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Force-update a service (rolling restart of all replicas).
+pub fn force_update_service(service_id: &str) -> Result<(), String> {
+    let output = Command::new("docker")
+        .args(["service", "update", "--force", service_id])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(err)
+    }
+}
+
+/// Scale a service to a given number of replicas.
+pub fn scale_service(service_id: &str, replicas: u32) -> Result<(), String> {
+    let arg = format!("{}={}", service_id, replicas);
+    let output = Command::new("docker")
+        .args(["service", "scale", &arg])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(err)
+    }
+}
+
+/// Start streaming service logs. Returns a receiver channel.
+/// Reads both stdout and stderr to avoid missing logs and pipe deadlocks.
+pub fn tail_service_logs(service_id: &str) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+
+    let id = service_id.to_string();
+    thread::spawn(move || {
+        let mut child = match Command::new("docker")
+            .args([
+                "service", "logs",
+                "--follow",
+                "--tail", "200",
+                "--timestamps",
+                &id,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(format!("[error] Failed to start log stream: {}", e));
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        // Read stdout in a separate thread
+        let tx_stdout = tx.clone();
+        let stdout_handle = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if tx_stdout.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Read stderr in the current thread
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Wait for stdout thread to finish
+        let _ = stdout_handle.join();
+
+        // Clean up the child process
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+
+    rx
+}

@@ -5,6 +5,7 @@ use bollard::container::{
 };
 use bollard::models::ContainerSummary;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use tokio::sync::mpsc;
 
 use crate::model::DockerContainerInfo;
@@ -40,11 +41,18 @@ impl DockerClient {
         };
 
         let mut containers = Vec::new();
-        for s in summaries {
-            let info = self.summary_to_info(&s).await;
-            containers.push(info);
+        for s in &summaries {
+            containers.push(self.summary_to_info(s));
         }
         containers
+    }
+
+    /// Fetch CPU stats for all containers concurrently instead of sequentially.
+    pub async fn get_all_cpu_percents(&self, ids: &[String]) -> Vec<f64> {
+        let futures: Vec<_> = ids.iter()
+            .map(|id| self.get_cpu_percent(id))
+            .collect();
+        join_all(futures).await
     }
 
     /// Fetch a one-shot stats snapshot for a container. Returns cpu_percent.
@@ -138,7 +146,7 @@ impl DockerClient {
 
     // --- Internal helpers ---
 
-    async fn summary_to_info(&self, s: &ContainerSummary) -> DockerContainerInfo {
+    fn summary_to_info(&self, s: &ContainerSummary) -> DockerContainerInfo {
         let id_full = s.id.clone().unwrap_or_default();
         let id_short = id_full.chars().take(12).collect::<String>();
 

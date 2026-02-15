@@ -1012,6 +1012,8 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures-util",
+ "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
 ]
