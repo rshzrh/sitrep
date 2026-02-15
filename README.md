@@ -39,6 +39,7 @@ When your server is busy and not responding, `sitrep` gives you the full picture
   - **Auto-hide**: The Swarm tab only appears when running on a Swarm manager node.
 
 - **Interactivity**:
+  - **View Titles**: Each view displays a clear title at the top (System, Containers, Swarm Cluster, etc.) so you always know which tab you're in.
   - **Tab Switching**: `Tab` / `Shift+Tab` to cycle between System, Containers, and Swarm views.
   - **Navigation**: Arrow keys to scroll and expand/collapse.
   - **Sorting**: Keys `c`, `m`, `r`, `w`, `d`, `u` to sort the process list.
@@ -84,6 +85,7 @@ sitrep
 #### Global
 
 - `q` / `Esc`: Quit
+- `Ctrl+C`: Force quit
 - `Tab`: Switch to next tab (System → Containers → Swarm)
 - `Shift+Tab`: Switch to previous tab
 
@@ -106,7 +108,7 @@ sitrep
 - `←`: Expand/collapse container details (image, ports, IP)
 - `s`: Start the selected container
 - `t`: Stop the selected container
-- `r`: Restart the selected container
+- `r`: Restart the selected container (confirm with `y`, cancel with `n` or `Esc`)
 
 #### Container Log Viewer (full-screen)
 
@@ -114,19 +116,20 @@ sitrep
 - `↑ / ↓`: Scroll through log history (pauses auto-follow)
 - `PageUp / PageDown`: Scroll by page
 - `f` / `End`: Resume auto-follow
+- `/`: Search mode (type query, Enter to confirm, Esc to cancel)
 
 #### Swarm Tab — Overview
 
 - `↑ / ↓`: Navigate nodes, stacks, and services
 - `→`: Expand section / drill into service tasks
 - `←`: Collapse section / go back
-- `R`: Rolling restart the selected service
+- `R`: Rolling restart the selected service (confirm with `y`, cancel with `n` or `Esc`)
 
 #### Swarm Tab — Task/Replica List
 
 - `↑ / ↓`: Navigate tasks
 - `→` / `L`: Open service log viewer
-- `R`: Rolling restart the service
+- `R`: Rolling restart the service (confirm with `y`, cancel with `n` or `Esc`)
 - `Esc` / `←`: Back to overview
 
 #### Service Log Viewer (full-screen)
@@ -136,6 +139,7 @@ sitrep
 - `PageUp / PageDown`: Scroll by page
 - `f` / `End`: Resume auto-follow
 - `e`: Toggle error-only filter (shows ERROR, panic, fatal, exception lines)
+- `/`: Search mode (type query, Enter to confirm, Esc to cancel)
 
 
 ## Docker Integration
@@ -169,6 +173,7 @@ Press `→` on any container to enter a full-screen log viewer:
 - Auto-scrolls to the latest output by default.
 - Press `↑` or `↓` to pause auto-follow and scroll through history.
 - Press `f` or `End` to resume following.
+- Press `/` to search (type query, Enter to confirm, Esc to cancel).
 - Press `Esc` or `←` to return to the container list.
 
 ### Container actions
@@ -179,7 +184,7 @@ From the container list, you can manage containers directly:
 - `t` — **Stop** a running container (10-second graceful timeout)
 - `r` — **Restart** a container (10-second graceful timeout)
 
-Action feedback is displayed as a status message in the container view.
+Destructive actions (stop, restart) require confirmation: press `y` to confirm or `n` / `Esc` to cancel. Action feedback is displayed as a status message in the container view.
 
 ### When Docker is unavailable
 
@@ -204,6 +209,7 @@ If Docker is not installed, the daemon is not running, or the socket is not acce
 3. **Service Drill-down**: Press `→` on a service to see all its tasks/replicas with node placement, desired state, current state, and any error messages. Failed/rejected tasks are highlighted in red, running tasks in green.
 4. **Aggregated Service Logs**: Press `→` or `L` from the task list to open a full-screen log viewer that streams logs from **all replicas** of the service (`docker service logs --follow`).
 5. **Error Filtering**: Press `e` in the log viewer to filter to only lines containing `error`, `panic`, `fatal`, `exception`, or `fail`.
+6. **Search**: Press `/` in the log viewer to search for text (Enter to confirm, Esc to cancel).
 
 ### Smart warnings
 
@@ -220,7 +226,7 @@ If Docker is not installed, the daemon is not running, or the socket is not acce
 
 From the Swarm overview or task list:
 
-- `R` — **Rolling restart**: Force-updates the service (`docker service update --force`), which triggers a rolling restart of all replicas according to the service's update configuration.
+- `R` — **Rolling restart**: Force-updates the service (`docker service update --force`), which triggers a rolling restart of all replicas according to the service's update configuration. Press `y` to confirm or `n` / `Esc` to cancel.
 
 ### Typical workflow
 
@@ -242,10 +248,29 @@ If Docker is not in Swarm mode, or `sitrep` is running on a worker node, the Swa
 ```
 src/
 ├── main.rs              # Thin entry point (panic hook, signals, app::run)
-├── app/                 # Application loop, input, render, event loop
+├── app/                 # Application orchestration
+│   ├── mod.rs           # App struct, main loop, run()
+│   ├── event_loop.rs   # Tick refresh, log polling, action polling, tab-switch refresh
+│   ├── input.rs        # Key handling, view-specific handlers
+│   ├── render.rs       # Render dispatch by AppView
+│   └── state.rs        # PendingAction, SwarmOverviewItem, resolve_swarm_overview_item
 ├── model/               # Data structures (system + Docker + Swarm)
-├── view/                # Terminal rendering (tab bar, system, containers, swarm, logs)
+│   ├── app.rs          # AppView enum
+│   ├── system.rs       # MonitorData, UIState, ProcessGroup, etc.
+│   ├── docker.rs       # DockerContainerInfo, LogViewState, ContainerUIState
+│   └── swarm.rs        # SwarmNodeInfo, SwarmServiceInfo, SwarmUIState, etc.
+├── view/                # Terminal rendering
+│   ├── mod.rs          # Presenter, RowKind
+│   ├── tab_bar.rs      # Tab bar with view titles
+│   ├── system.rs       # System report (sections, processes)
+│   ├── containers.rs   # Container list
+│   ├── swarm.rs        # Swarm overview, tasks
+│   ├── logs.rs         # Container + service logs
+│   ├── confirmation.rs # Pending action prompt
+│   └── shared.rs       # truncate_str, progress_bar, etc.
 ├── controller/          # System data collection & processing
+│   ├── mod.rs          # Monitor, update()
+│   └── process.rs      # Process grouping, compute_top_processes
 ├── layout.rs            # Section layout system (collapsible sections)
 ├── docker.rs            # Docker API client (bollard wrapper)
 ├── docker_controller.rs # Docker data collection & log streaming
@@ -258,6 +283,8 @@ src/
 ```
 
 MVC architecture with a reusable `Layout` system for defining report sections. Docker container integration uses [bollard](https://crates.io/crates/bollard) (async Docker API) for standalone containers. Swarm integration uses the `docker` CLI with JSON output for cluster-wide operations (nodes, services, tasks, service logs).
+
+For a detailed technical breakdown of data flow, sequence diagrams, and component responsibilities, see [Architecture.md](Architecture.md).
 
 ## Roadmap
 
