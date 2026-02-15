@@ -14,6 +14,11 @@ pub fn render_containers(
 
     let size = crossterm::terminal::size()?;
 
+    queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+    writeln(&mut out, "  Containers")?;
+    queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
+    writeln(&mut out, "")?;
+
     if containers.is_empty() {
         writeln(&mut out, "")?;
         writeln(&mut out, "  No running containers found.")?;

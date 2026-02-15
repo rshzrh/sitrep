@@ -19,7 +19,7 @@ pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
     } else {
         String::new()
     };
-    let header = format!("  Logs: {} ({}) - {}{}",
+    let header = format!("  Containers › Logs: {} ({}) - {}{}",
         log_state.container_name, log_state.container_id, follow_indicator, search_indicator);
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
@@ -124,7 +124,7 @@ pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
     } else {
         String::new()
     };
-    let header = format!("  Service Logs: {} ({}) - {}{}{}",
+    let header = format!("  Swarm › Service Logs: {} ({}) - {}{}{}",
         log_state.service_name, log_state.service_id, follow_indicator, filter_indicator, search_indicator);
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;

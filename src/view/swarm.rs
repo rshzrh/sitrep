@@ -31,6 +31,11 @@ pub fn render_swarm_overview(
 
     let size = crossterm::terminal::size()?;
 
+    queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+    writeln(&mut out, "  Swarm Cluster")?;
+    queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
+    writeln(&mut out, "")?;
+
     if let Some(info) = cluster_info {
         queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
         write!(out, "  Cluster: {} nodes ({} managers) | This node: {}\r\n",
@@ -164,7 +169,7 @@ pub fn render_swarm_tasks(
     let size = crossterm::terminal::size()?;
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
-    writeln(&mut out, &format!("  Service: {} — Tasks/Replicas", service_name))?;
+    writeln(&mut out, &format!("  Swarm › Tasks: {}", service_name))?;
     queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
     writeln(&mut out, "")?;
 

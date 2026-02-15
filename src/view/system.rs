@@ -16,7 +16,10 @@ pub fn render(
     let mut rows: Vec<(Pid, RowKind)> = Vec::new();
     let mut current_row: usize = 0;
 
-    writeln(&mut out, &format!("  sitrep — {}  |  Cores: {}", data.time, data.core_count))?;
+    queue!(out, SetAttribute(Attribute::Bold))?;
+    writeln(&mut out, "  System")?;
+    queue!(out, SetAttribute(Attribute::Reset))?;
+    writeln(&mut out, &format!("  {}  |  Cores: {}", data.time, data.core_count))?;
     writeln(&mut out, "")?;
 
     for section in &layout.sections {
