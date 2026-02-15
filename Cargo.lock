@@ -1014,6 +1014,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "signal-hook",
  "sysinfo",
  "tokio",
 ]

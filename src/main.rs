@@ -10,6 +10,7 @@ pub mod swarm_controller;
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use crossterm::{
     execute,
@@ -23,7 +24,45 @@ use model::{AppView, SortColumn, SwarmViewLevel};
 use view::{Presenter, RowKind};
 use sysinfo::Pid;
 
+/// Restore the terminal to normal mode. Safe to call multiple times.
+fn restore_terminal() {
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+/// Pending destructive action awaiting confirmation.
+struct PendingAction {
+    description: String,
+    kind: PendingActionKind,
+    expires: Instant,
+}
+
+enum PendingActionKind {
+    ContainerStart(String),
+    ContainerStop(String),
+    ContainerRestart(String),
+    SwarmRollingRestart(String),
+}
+
 fn main() -> io::Result<()> {
+    // Install panic hook that restores terminal before printing the panic
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
+    // Register signal handler for SIGTERM / SIGINT (Unix)
+    let should_quit = Arc::new(AtomicBool::new(false));
+    {
+        let quit_flag = Arc::clone(&should_quit);
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, quit_flag);
+    }
+    {
+        let quit_flag = Arc::clone(&should_quit);
+        let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, quit_flag);
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, Clear(ClearType::All))?;
@@ -47,9 +86,23 @@ fn main() -> io::Result<()> {
     let mut needs_render = true;
     let mut app_view = AppView::System;
     let mut tick_counter: u64 = 0; // counts 3s ticks
+    let mut pending_action: Option<PendingAction> = None;
 
     loop {
+        // Check for OS signals (SIGTERM, SIGINT)
+        if should_quit.load(Ordering::Relaxed) {
+            break;
+        }
+
         let now = Instant::now();
+
+        // Expire pending confirmation
+        if let Some(ref pa) = pending_action {
+            if now > pa.expires {
+                pending_action = None;
+                needs_render = true;
+            }
+        }
 
         // --- Tick-based data refresh (every 3 seconds) ---
         if now.duration_since(last_tick) >= tick_rate {
@@ -190,6 +243,11 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
+            // Render confirmation banner if there's a pending action
+            if let Some(ref pa) = pending_action {
+                Presenter::render_confirmation(&pa.description)?;
+            }
+
             needs_render = false;
         }
 
@@ -200,6 +258,31 @@ fn main() -> io::Result<()> {
                 // Global: Ctrl+C always quits
                 if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                     break;
+                }
+
+                // Handle pending confirmation
+                if pending_action.is_some() {
+                    if code == KeyCode::Char('y') || code == KeyCode::Char('Y') {
+                        let pa = pending_action.take().unwrap();
+                        match pa.kind {
+                            PendingActionKind::ContainerStart(id) => {
+                                docker_monitor.start_container(&id);
+                            }
+                            PendingActionKind::ContainerStop(id) => {
+                                docker_monitor.stop_container(&id);
+                            }
+                            PendingActionKind::ContainerRestart(id) => {
+                                docker_monitor.restart_container(&id);
+                            }
+                            PendingActionKind::SwarmRollingRestart(id) => {
+                                swarm_monitor.force_restart_service(&id);
+                            }
+                        }
+                    } else {
+                        pending_action = None;
+                    }
+                    needs_render = true;
+                    continue;
                 }
 
                 // Helper: compute next/prev tab
@@ -256,7 +339,7 @@ fn main() -> io::Result<()> {
                     // ==========================================================
                     AppView::System => {
                         match code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('q') => break,
                             KeyCode::Tab => {
                                 app_view = next_tab(&app_view);
                                 needs_render = true;
@@ -357,7 +440,10 @@ fn main() -> io::Result<()> {
                     // ==========================================================
                     AppView::Containers => {
                         match code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                app_view = AppView::System;
+                                needs_render = true;
+                            }
                             KeyCode::Tab => {
                                 app_view = next_tab(&app_view);
                                 needs_render = true;
@@ -399,21 +485,33 @@ fn main() -> io::Result<()> {
                                     needs_render = true;
                                 }
                             }
-                            KeyCode::Char('s') => {
+                            KeyCode::Char('S') => {
                                 if let Some(c) = docker_monitor.selected_container().cloned() {
-                                    docker_monitor.start_container(&c.id);
+                                    pending_action = Some(PendingAction {
+                                        description: format!("Start container '{}'?", c.name),
+                                        kind: PendingActionKind::ContainerStart(c.id),
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
                                     needs_render = true;
                                 }
                             }
-                            KeyCode::Char('t') => {
+                            KeyCode::Char('T') => {
                                 if let Some(c) = docker_monitor.selected_container().cloned() {
-                                    docker_monitor.stop_container(&c.id);
+                                    pending_action = Some(PendingAction {
+                                        description: format!("Stop container '{}'?", c.name),
+                                        kind: PendingActionKind::ContainerStop(c.id),
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
                                     needs_render = true;
                                 }
                             }
-                            KeyCode::Char('r') => {
+                            KeyCode::Char('R') => {
                                 if let Some(c) = docker_monitor.selected_container().cloned() {
-                                    docker_monitor.restart_container(&c.id);
+                                    pending_action = Some(PendingAction {
+                                        description: format!("Restart container '{}'?", c.name),
+                                        kind: PendingActionKind::ContainerRestart(c.id),
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
                                     needs_render = true;
                                 }
                             }
@@ -457,8 +555,7 @@ fn main() -> io::Result<()> {
                             }
                         } else {
                         match code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc | KeyCode::Left => {
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => {
                                 docker_monitor.stop_log_stream();
                                 app_view = AppView::Containers;
                                 needs_render = true;
@@ -541,7 +638,10 @@ fn main() -> io::Result<()> {
                     // ==========================================================
                     AppView::Swarm => {
                         match code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                app_view = AppView::System;
+                                needs_render = true;
+                            }
                             KeyCode::Tab => {
                                 app_view = next_tab(&app_view);
                                 needs_render = true;
@@ -611,11 +711,14 @@ fn main() -> io::Result<()> {
                                 }
                             }
                             KeyCode::Char('R') => {
-                                // Rolling restart selected service
                                 let sel = swarm_monitor.ui_state.selected_index;
                                 let item = resolve_swarm_overview_item(&swarm_monitor, sel);
-                                if let SwarmOverviewItem::Service(id, _) = item {
-                                    swarm_monitor.force_restart_service(&id);
+                                if let SwarmOverviewItem::Service(id, name) = item {
+                                    pending_action = Some(PendingAction {
+                                        description: format!("Rolling restart service '{}'?", name),
+                                        kind: PendingActionKind::SwarmRollingRestart(id),
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
                                     needs_render = true;
                                 }
                             }
@@ -628,8 +731,7 @@ fn main() -> io::Result<()> {
                     // ==========================================================
                     AppView::SwarmServiceTasks(_, _) => {
                         match code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc | KeyCode::Left => {
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => {
                                 swarm_monitor.go_back();
                                 app_view = AppView::Swarm;
                                 needs_render = true;
@@ -655,9 +757,12 @@ fn main() -> io::Result<()> {
                                 }
                             }
                             KeyCode::Char('R') => {
-                                // Rolling restart
-                                if let SwarmViewLevel::ServiceTasks(ref svc_id, _) = swarm_monitor.ui_state.view_level.clone() {
-                                    swarm_monitor.force_restart_service(svc_id);
+                                if let SwarmViewLevel::ServiceTasks(ref svc_id, ref svc_name) = swarm_monitor.ui_state.view_level.clone() {
+                                    pending_action = Some(PendingAction {
+                                        description: format!("Rolling restart service '{}'?", svc_name),
+                                        kind: PendingActionKind::SwarmRollingRestart(svc_id.clone()),
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
                                     needs_render = true;
                                 }
                             }
@@ -701,8 +806,7 @@ fn main() -> io::Result<()> {
                             }
                         } else {
                         match code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Esc | KeyCode::Left => {
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => {
                                 swarm_monitor.stop_log_stream();
                                 swarm_monitor.ui_state.view_level = SwarmViewLevel::Overview;
                                 app_view = AppView::Swarm;
@@ -791,8 +895,7 @@ fn main() -> io::Result<()> {
         }
     }
 
-    execute!(stdout, LeaveAlternateScreen)?;
-    disable_raw_mode()?;
+    restore_terminal();
     Ok(())
 }
 

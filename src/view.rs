@@ -148,7 +148,7 @@ impl Presenter {
         ui_state.total_rows = current_row;
 
         // Footer with help
-        let help = "q: Quit | Tab: Switch | ↑/↓: Navigate | →/←: Expand/Collapse | Sort: (c)pu (m)em (r)ead (w)rite (d)ownload (u)pload";
+        let help = "q: Quit | Ctrl+C: Force Quit | Tab: Switch | ↑/↓: Navigate | →/←: Expand/Collapse | Sort: (c)pu (m)em (r)ead (w)rite (d)ownload (u)pload";
         let size = terminal::size()?;
         let help_y = size.1.saturating_sub(1);
         queue!(
@@ -235,7 +235,7 @@ impl Presenter {
         }
 
         // Footer
-        let help = "q: Quit | Tab: Switch | ↑/↓: Navigate | →: Logs | s: Start | t: Stop | r: Restart";
+        let help = "q/Esc: Back | Tab: Switch | ↑/↓: Navigate | →: Logs | S: Start | T: Stop | R: Restart (confirm with y)";
         let help_y = size.1.saturating_sub(1);
         queue!(
             out,
@@ -320,11 +320,7 @@ impl Presenter {
         let mut lines_printed = 0;
         for i in start_line..end_line {
             if let Some(line) = display_lines.get(i) {
-                let display_line = if line.len() > width {
-                    &line[..width]
-                } else {
-                    line.as_str()
-                };
+                let display_line = safe_truncate(line, width);
 
                 // Highlight search matches
                 if has_search {
@@ -352,9 +348,9 @@ impl Presenter {
         let help = if log_state.search_mode {
             "Type to search | Enter: Confirm | Esc: Cancel"
         } else if has_search {
-            "Esc/←: Back | ↑/↓: Scroll | f/End: Follow | /: Search | n: Clear search"
+            "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | /: Search | n: Clear search"
         } else {
-            "Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow | /: Search"
+            "q/Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow | /: Search"
         };
         let help_y = (height.saturating_sub(1)) as u16;
         queue!(
@@ -511,7 +507,7 @@ impl Presenter {
         }
 
         // Footer
-        let help = "q: Quit | Tab: Switch | ↑/↓: Navigate | →: Expand/Drill | ←: Collapse/Back | R: Rolling Restart";
+        let help = "q/Esc: Back | Tab: Switch | ↑/↓: Navigate | →: Expand/Drill | ←: Collapse/Back | R: Rolling Restart (confirm with y)";
         let help_y = size.1.saturating_sub(1);
         queue!(
             out,
@@ -589,7 +585,7 @@ impl Presenter {
         }
 
         // Footer
-        let help = "Esc/←: Back | ↑/↓: Navigate | →/L: Service Logs | R: Rolling Restart";
+        let help = "q/Esc/←: Back | ↑/↓: Navigate | →/L: Service Logs | R: Rolling Restart (confirm with y)";
         let help_y = size.1.saturating_sub(1);
         queue!(
             out,
@@ -700,11 +696,7 @@ impl Presenter {
                     queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
                 }
 
-                let display_line = if line.len() > width {
-                    &line[..width]
-                } else {
-                    line
-                };
+                let display_line = safe_truncate(line, width);
                 write!(out, "{}\r\n", display_line)?;
 
                 if is_error || is_match {
@@ -722,9 +714,9 @@ impl Presenter {
         let help = if log_state.search_mode {
             "Type to search | Enter: Confirm | Esc: Cancel"
         } else if has_search {
-            "Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Errors | /: Search | n: Clear search"
+            "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Errors | /: Search | n: Clear search"
         } else {
-            "Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Toggle Error Filter | /: Search"
+            "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Toggle Error Filter | /: Search"
         };
         let help_y = (height.saturating_sub(1)) as u16;
         queue!(
@@ -1058,6 +1050,26 @@ impl Presenter {
         Ok(())
     }
 
+    // =====================================================================
+    // Confirmation banner (rendered over the status bar area)
+    // =====================================================================
+
+    pub fn render_confirmation(prompt: &str) -> io::Result<()> {
+        let mut out = stdout();
+        let size = terminal::size()?;
+        let y = size.1.saturating_sub(3);
+        let width = size.0 as usize;
+
+        // Clear the confirmation area
+        queue!(out, MoveTo(0, y))?;
+        queue!(out, SetBackgroundColor(Color::DarkRed), SetForegroundColor(Color::White), SetAttribute(Attribute::Bold))?;
+        let line = format!("  {} (y to confirm, any other key to cancel)  ", prompt);
+        write!(out, "{:<width$}", line, width = width)?;
+        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+        out.flush()?;
+        Ok(())
+    }
+
     // --- Helpers ---
 
     fn writeln(out: &mut impl Write, text: &str) -> io::Result<()> {
@@ -1116,10 +1128,28 @@ impl Presenter {
     }
 }
 
+/// Truncate a string to at most `max_len` characters (not bytes), appending "..."
+/// if truncated. Safe for multi-byte UTF-8.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let keep = max_len.saturating_sub(3);
+        let truncated: String = s.chars().take(keep).collect();
+        format!("{}...", truncated)
     }
+}
+
+/// Truncate a string to at most `max_len` characters for display. Returns a &str
+/// slice up to the last valid char boundary within `max_len` bytes.
+fn safe_truncate(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        return s;
+    }
+    let mut end = max_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
