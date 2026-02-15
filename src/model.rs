@@ -1,5 +1,5 @@
 use sysinfo::Pid;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 // --- Process-level data ---
 
@@ -111,6 +111,77 @@ pub struct MonitorData {
     #[allow(dead_code)]
     pub context_switches: ContextSwitchInfo,
     pub socket_overview: SocketOverviewInfo,
+}
+
+// --- Docker data ---
+
+#[derive(Clone, Debug)]
+pub struct DockerContainerInfo {
+    pub id: String,           // short ID (first 12 chars)
+    pub name: String,         // container name
+    pub image: String,        // image name (shown when expanded)
+    pub status: String,       // "running", "paused", etc.
+    pub state: String,        // raw state string from Docker
+    pub uptime: String,       // human-readable (e.g. "2h 34m")
+    pub cpu_percent: f64,     // from stats
+    pub ports: String,        // e.g. "0.0.0.0:8080->80/tcp"
+    pub ip_address: String,   // internal IP from NetworkSettings
+}
+
+// --- App-level view state ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppView {
+    System,
+    Containers,
+    ContainerLogs(String), // container ID
+}
+
+// --- Log viewer state ---
+
+pub struct LogViewState {
+    pub container_id: String,
+    pub container_name: String,
+    pub lines: VecDeque<String>,
+    pub scroll_offset: usize,  // 0 = at bottom (following)
+    pub auto_follow: bool,
+}
+
+impl LogViewState {
+    pub fn new(container_id: String, container_name: String) -> Self {
+        Self {
+            container_id,
+            container_name,
+            lines: VecDeque::with_capacity(5000),
+            scroll_offset: 0,
+            auto_follow: true,
+        }
+    }
+
+    pub fn push_line(&mut self, line: String) {
+        if self.lines.len() >= 5000 {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line);
+    }
+}
+
+// --- Container UI state ---
+
+pub struct ContainerUIState {
+    pub selected_index: usize,
+    pub total_rows: usize,
+    pub expanded_ids: HashSet<String>,
+}
+
+impl Default for ContainerUIState {
+    fn default() -> Self {
+        Self {
+            selected_index: 0,
+            total_rows: 0,
+            expanded_ids: HashSet::new(),
+        }
+    }
 }
 
 // --- UI State ---

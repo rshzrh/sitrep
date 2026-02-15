@@ -1,4 +1,4 @@
-use crate::model::{MonitorData, UIState};
+use crate::model::{MonitorData, UIState, AppView, DockerContainerInfo, ContainerUIState, LogViewState};
 use crate::layout::{Layout, SectionId};
 use std::io::{self, Write, stdout};
 use crossterm::{
@@ -19,19 +19,77 @@ pub enum RowKind {
 pub struct Presenter;
 
 impl Presenter {
+    // =====================================================================
+    // Tab bar (rendered at the top of every view except full-screen logs)
+    // =====================================================================
+
+    pub fn render_tab_bar(
+        out: &mut impl Write,
+        current_view: &AppView,
+        docker_available: bool,
+        container_count: usize,
+        time: &str,
+    ) -> io::Result<()> {
+        write!(out, "  ")?;
+
+        // System tab
+        let system_active = matches!(current_view, AppView::System);
+        if system_active {
+            queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+        } else {
+            queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        }
+        write!(out, " System ")?;
+        queue!(io::stdout(), ResetColor)?;
+
+        if docker_available {
+            write!(out, "  ")?;
+            let containers_active = matches!(current_view, AppView::Containers | AppView::ContainerLogs(_));
+            if containers_active {
+                queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+            } else {
+                queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+            }
+            write!(out, " Containers ({}) ", container_count)?;
+            queue!(io::stdout(), ResetColor)?;
+        }
+
+        // Right-align the time
+        let size = terminal::size()?;
+        let time_str = format!("sitrep - {} ", time);
+        let col = (size.0 as usize).saturating_sub(time_str.len());
+        queue!(io::stdout(), cursor::MoveTo(col as u16, 0))?;
+        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        write!(out, "{}", time_str)?;
+        queue!(io::stdout(), ResetColor)?;
+
+        write!(out, "\r\n")?;
+        // Separator
+        let sep: String = "─".repeat(size.0 as usize);
+        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        write!(out, "{}\r\n", sep)?;
+        queue!(io::stdout(), ResetColor)?;
+
+        Ok(())
+    }
+
+    // =====================================================================
+    // System view (the original render, now refactored)
+    // =====================================================================
+
     pub fn render(
         data: &MonitorData,
         ui_state: &mut UIState,
         layout: &Layout,
     ) -> io::Result<Vec<(Pid, RowKind)>> {
         let mut out = stdout();
-        execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+        // Tab bar + clear is handled by main.rs before calling this
 
         let mut rows: Vec<(Pid, RowKind)> = Vec::new();
         let mut current_row: usize = 0;
 
         // Time header
-        Self::writeln(&mut out, &format!("  adtop — {}  |  Cores: {}", data.time, data.core_count))?;
+        Self::writeln(&mut out, &format!("  sitrep — {}  |  Cores: {}", data.time, data.core_count))?;
         Self::writeln(&mut out, "")?;
 
         for section in &layout.sections {
@@ -69,14 +127,14 @@ impl Presenter {
         ui_state.total_rows = current_row;
 
         // Footer with help
-        let help = "q: Quit | Space: Pause | ↑/↓: Navigate | →/←: Expand/Collapse | Sort: (c)pu (m)em (r)ead (w)rite (d)ownload (u)pload";
+        let help = "q: Quit | Tab: Switch | ↑/↓: Navigate | →/←: Expand/Collapse | Sort: (c)pu (m)em (r)ead (w)rite (d)ownload (u)pload";
         let size = terminal::size()?;
-        let help_y = size.1.saturating_sub(1); // Use size.1 for height
+        let help_y = size.1.saturating_sub(1);
         queue!(
             out,
             MoveTo(1, help_y),
             SetForegroundColor(Color::DarkGrey),
-            Print(format!("{:<width$}", help, width = size.0 as usize)), // Use size.0 for width
+            Print(format!("{:<width$}", help, width = size.0 as usize)),
             ResetColor
         )?;
 
@@ -88,6 +146,165 @@ impl Presenter {
 
         out.flush()?;
         Ok(rows)
+    }
+
+    // =====================================================================
+    // Container list view
+    // =====================================================================
+
+    pub fn render_containers(
+        containers: &[DockerContainerInfo],
+        ui_state: &ContainerUIState,
+        status_message: &Option<String>,
+    ) -> io::Result<()> {
+        let mut out = stdout();
+        // Tab bar already rendered; we start from row 2
+        queue!(out, cursor::MoveTo(0, 2))?;
+
+        let size = terminal::size()?;
+
+        if containers.is_empty() {
+            Self::writeln(&mut out, "")?;
+            Self::writeln(&mut out, "  No running containers found.")?;
+            Self::writeln(&mut out, "")?;
+            Self::writeln(&mut out, "  Make sure Docker is running and you have containers up.")?;
+        } else {
+            Self::writeln(&mut out, "")?;
+
+            // Column header
+            queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+            write!(out, "  {:<14} {:<20} {:<12} {:<10} {:<8} {:<26} {}",
+                "CONTAINER ID", "NAME", "STATUS", "UPTIME", "CPU %", "PORTS", "IP")?;
+            queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
+            write!(out, "\r\n")?;
+
+            for (idx, c) in containers.iter().enumerate() {
+                let selected = idx == ui_state.selected_index;
+
+                let line = format!("  {:<14} {:<20} {:<12} {:<10} {:<8.1} {:<26} {}",
+                    c.id,
+                    truncate_str(&c.name, 18),
+                    truncate_str(&c.state, 10),
+                    c.uptime,
+                    c.cpu_percent,
+                    truncate_str(&c.ports, 24),
+                    c.ip_address,
+                );
+
+                Self::write_selectable(&mut out, &line, selected)?;
+
+                // Expanded detail
+                if ui_state.expanded_ids.contains(&c.id) {
+                    queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+                    Self::writeln(&mut out, &format!("    Image:  {}", c.image))?;
+                    Self::writeln(&mut out, &format!("    Status: {}", c.status))?;
+                    Self::writeln(&mut out, &format!("    Ports:  {}", c.ports))?;
+                    Self::writeln(&mut out, &format!("    IP:     {}", c.ip_address))?;
+                    queue!(io::stdout(), ResetColor)?;
+                }
+            }
+        }
+
+        // Status message (action feedback)
+        if let Some(msg) = status_message {
+            Self::writeln(&mut out, "")?;
+            queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+            Self::writeln(&mut out, &format!("  {}", msg))?;
+            queue!(io::stdout(), ResetColor)?;
+        }
+
+        // Footer
+        let help = "q: Quit | Tab: Switch | ↑/↓: Navigate | →: Logs | s: Start | t: Stop | r: Restart";
+        let help_y = size.1.saturating_sub(1);
+        queue!(
+            out,
+            MoveTo(1, help_y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{:<width$}", help, width = size.0 as usize)),
+            ResetColor
+        )?;
+
+        out.flush()?;
+        Ok(())
+    }
+
+    // =====================================================================
+    // Full-screen log viewer
+    // =====================================================================
+
+    pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
+        let mut out = stdout();
+        execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+
+        let size = terminal::size()?;
+        let width = size.0 as usize;
+        let height = size.1 as usize;
+
+        // Header
+        let follow_indicator = if log_state.auto_follow { "FOLLOWING" } else { "PAUSED" };
+        let header = format!("  Logs: {} ({}) - {}",
+            log_state.container_name, log_state.container_id, follow_indicator);
+
+        queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
+        if !log_state.auto_follow {
+            queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+        }
+        write!(out, "{}\r\n", header)?;
+        queue!(io::stdout(), SetAttribute(Attribute::Reset), ResetColor)?;
+
+        // Separator
+        let sep: String = "─".repeat(width);
+        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        write!(out, "{}\r\n", sep)?;
+        queue!(io::stdout(), ResetColor)?;
+
+        // Log content area: height - 4 (header + separator + footer + blank)
+        let log_area_height = height.saturating_sub(4);
+        let total_lines = log_state.lines.len();
+
+        let start_line = if log_state.auto_follow {
+            // Show the last `log_area_height` lines
+            total_lines.saturating_sub(log_area_height)
+        } else {
+            // Manual scroll: scroll_offset is lines from the bottom
+            let bottom_start = total_lines.saturating_sub(log_area_height);
+            bottom_start.saturating_sub(log_state.scroll_offset)
+        };
+
+        let end_line = (start_line + log_area_height).min(total_lines);
+
+        let mut lines_printed = 0;
+        for i in start_line..end_line {
+            if let Some(line) = log_state.lines.get(i) {
+                // Truncate line to terminal width
+                let display_line = if line.len() > width {
+                    &line[..width]
+                } else {
+                    line
+                };
+                write!(out, "{}\r\n", display_line)?;
+                lines_printed += 1;
+            }
+        }
+
+        // Fill remaining space
+        for _ in lines_printed..log_area_height {
+            write!(out, "\r\n")?;
+        }
+
+        // Footer
+        let help = "Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow";
+        let help_y = (height.saturating_sub(1)) as u16;
+        queue!(
+            out,
+            MoveTo(1, help_y),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("{:<width$}", help, width = width)),
+            ResetColor
+        )?;
+
+        out.flush()?;
+        Ok(())
     }
 
     // --- Section renderers ---
@@ -451,5 +668,13 @@ impl Presenter {
             result.push(b as char);
         }
         result.chars().rev().collect()
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
     }
 }

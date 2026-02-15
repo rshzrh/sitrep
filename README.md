@@ -2,7 +2,7 @@
 
 **Situation Report** — A real-time terminal diagnostic tool for server triage.
 
-When your server is busy and not responding, `sitrep` gives you the full picture at a glance: CPU, memory, disk, network, file descriptors, context switches, and socket health — all in one interactive terminal UI.
+When your server is busy and not responding, `sitrep` gives you the full picture at a glance: CPU, memory, disk, network, file descriptors, context switches, socket health, and Docker containers — all in one interactive terminal UI.
 
 ## Features
 
@@ -20,7 +20,15 @@ When your server is busy and not responding, `sitrep` gives you the full picture
   - **Expandable**: Grouped by parent process; expand to see child processes.
   - **Network Stats**: Per-process upload/download rates sourced from `nettop`.
 
+- **Docker Containers** (auto-detected):
+  - **Container List**: Running containers with name, status, uptime, CPU %, exposed ports, and internal IP.
+  - **Live Logs**: Full-screen `tail -f` style log viewer with auto-follow and manual scroll.
+  - **Container Actions**: Start, stop, and restart containers directly from the TUI.
+  - **Expandable Details**: View image, full status, port mappings, and network info per container.
+  - **Auto-hide**: The Containers tab is hidden when Docker is not installed or the daemon is not running.
+
 - **Interactivity**:
+  - **Tab Switching**: `Tab` / `Shift+Tab` to switch between System and Containers views.
   - **Navigation**: Arrow keys to scroll and expand/collapse.
   - **Sorting**: Keys `c`, `m`, `r`, `w`, `d`, `u` to sort the process list.
   - **Pause**: Spacebar to pause/resume updates.
@@ -62,11 +70,17 @@ sitrep
 
 ### Controls
 
-- `q`: Quit
-- `Space`: Pause/Resumze
+#### Global
+
+- `q` / `Esc`: Quit
+- `Tab`: Switch to next tab (System / Containers)
+- `Shift+Tab`: Switch to previous tab
+
+#### System Tab
+
 - `↑ / ↓`: Navigate list
-- `→`: Expand process group (or collapse section)
-- `←`: Collapse process group (or expand section)
+- `→`: Expand process group or uncollapse section
+- `←`: Collapse process group or collapse section
 - `c`: Sort by CPU
 - `m`: Sort by Memory
 - `r`: Sort by Disk Read
@@ -74,19 +88,88 @@ sitrep
 - `d`: Sort by Network Download
 - `u`: Sort by Network Upload
 
+#### Containers Tab
+
+- `↑ / ↓`: Navigate container list
+- `→`: Open live log viewer for the selected container
+- `←`: Expand/collapse container details (image, ports, IP)
+- `s`: Start the selected container
+- `t`: Stop the selected container
+- `r`: Restart the selected container
+
+#### Log Viewer (full-screen)
+
+- `Esc` / `←`: Return to container list
+- `↑ / ↓`: Scroll through log history (pauses auto-follow)
+- `PageUp / PageDown`: Scroll by page
+- `f` / `End`: Resume auto-follow
+
+
+## Docker Integration
+
+`sitrep` includes built-in Docker container monitoring. If Docker is installed and the daemon is running, a **Containers** tab appears automatically.
+
+### Requirements
+
+- Docker Engine or Docker Desktop installed and running.
+- The user running `sitrep` must have access to the Docker socket:
+  - **Linux**: be in the `docker` group (`sudo usermod -aG docker $USER`) or run as root.
+  - **macOS**: Docker Desktop handles permissions automatically.
+
+### What it shows
+
+| Column | Description |
+|---|---|
+| Container ID | Short 12-character container ID |
+| Name | Container name |
+| Status | Current state (running, paused, etc.) |
+| Uptime | Time since container was created |
+| CPU % | Live CPU usage percentage |
+| Ports | Exposed port mappings (e.g. `0.0.0.0:8080->80/tcp`) |
+| IP | Internal container IP address |
+
+### Live log viewer
+
+Press `→` on any container to enter a full-screen log viewer:
+
+- Streams logs in real time (`tail -f` behavior).
+- Auto-scrolls to the latest output by default.
+- Press `↑` or `↓` to pause auto-follow and scroll through history.
+- Press `f` or `End` to resume following.
+- Press `Esc` or `←` to return to the container list.
+
+### Container actions
+
+From the container list, you can manage containers directly:
+
+- `s` — **Start** a stopped container
+- `t` — **Stop** a running container (10-second graceful timeout)
+- `r` — **Restart** a container (10-second graceful timeout)
+
+Action feedback is displayed as a status message in the container view.
+
+### When Docker is unavailable
+
+If Docker is not installed, the daemon is not running, or the socket is not accessible, the Containers tab is simply hidden. No error is shown and the System tab works as normal.
 
 ## Architecture
 
 ```
 src/
-├── main.rs         # Application loop & input handling
-├── model.rs        # Data structures
-├── view.rs         # Terminal rendering
-├── controller.rs   # Data collection & processing
-└── layout.rs       # Section layout system (collapsible sections)
+├── main.rs              # Application loop, tab switching & input handling
+├── model.rs             # Data structures (system + Docker)
+├── view.rs              # Terminal rendering (tab bar, system, containers, logs)
+├── controller.rs        # System data collection & processing
+├── layout.rs            # Section layout system (collapsible sections)
+├── docker.rs            # Docker API client (bollard wrapper)
+├── docker_controller.rs # Docker data collection & log streaming
+└── collectors/
+    ├── mod.rs           # Platform collector trait
+    ├── mac.rs           # macOS-specific collector
+    └── linux.rs         # Linux-specific collector
 ```
 
-MVC architecture with a reusable `Layout` system for defining report sections.
+MVC architecture with a reusable `Layout` system for defining report sections. Docker integration uses a separate `DockerMonitor` backed by the [bollard](https://crates.io/crates/bollard) crate, communicating with the Docker daemon over the local Unix socket.
 
 ## Roadmap
 
@@ -106,8 +189,7 @@ The #1 priority. `sitrep` currently uses macOS-specific system commands (`iostat
 
 - [ ] **GPU monitoring** — NVIDIA (`nvidia-smi`) and Apple Silicon GPU usage
 - [ ] **Per-disk I/O breakdown** — show read/write rates per individual disk, not just aggregate busy %
-- [ ] **Temperature sensors** — CPU/GPU/disk temperatures where available
-- [ ] **Container awareness** — detect Docker/Podman containers and show per-container resource usage
+- [x] **Container awareness** — Docker container monitoring with live stats, log tailing, and start/stop/restart actions
 - [ ] **Alerting & thresholds** — configurable warning thresholds (not just the hardcoded 10% disk), with optional desktop notifications
 - [ ] **Process tree view** — full hierarchical process tree with fold/unfold, not just parent grouping
 - [ ] **Historical sparklines** — tiny inline graphs showing trends for CPU, memory, and network over the last few minutes
