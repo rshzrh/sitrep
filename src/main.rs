@@ -159,6 +159,14 @@ fn main() -> io::Result<()> {
             }
         }
 
+        // --- Poll background actions (container start/stop/restart, rolling restart, scale) ---
+        if docker_monitor.action_in_progress && docker_monitor.poll_action() {
+            needs_render = true;
+        }
+        if swarm_monitor.action_in_progress && swarm_monitor.poll_action() {
+            needs_render = true;
+        }
+
         // --- Immediate refresh on tab switch (avoid stale data) ---
         if app_view != prev_app_view {
             let since_last = now.duration_since(last_tab_refresh);

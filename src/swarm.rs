@@ -1,12 +1,26 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use serde::Deserialize;
 
 use crate::model::{SwarmClusterInfo, SwarmNodeInfo, SwarmServiceInfo, SwarmTaskInfo};
+
+/// Handle returned by `tail_service_logs` to kill the child process on cleanup.
+pub struct LogStreamHandle {
+    pub receiver: mpsc::Receiver<String>,
+    kill_flag: Arc<AtomicBool>,
+}
+
+impl LogStreamHandle {
+    /// Signal the child process to stop and drop resources.
+    pub fn kill(&self) {
+        self.kill_flag.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Typed struct for docker info Swarm section (avoids serde_json::Value overhead)
 #[derive(Deserialize)]
@@ -78,41 +92,42 @@ pub fn detect_swarm() -> Option<SwarmClusterInfo> {
 }
 
 /// List all nodes in the Swarm cluster.
-pub fn list_nodes() -> Vec<SwarmNodeInfo> {
-    let output = match Command::new("docker")
+pub fn list_nodes() -> Result<Vec<SwarmNodeInfo>, String> {
+    let output = Command::new("docker")
         .args(["node", "ls", "--format", "{{json .}}"])
         .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
+        .map_err(|e| format!("Failed to run docker node ls: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("docker node ls failed: {}", stderr));
+    }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
+    Ok(text.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| {
             let mut node: SwarmNodeInfo = serde_json::from_str(line).ok()?;
-            // docker node ls outputs "Self" as a bool or "*"
-            // The format template returns true/false for Self field
-            // but the JSON might show it as a string. Handle both.
             if node.manager_status.is_empty() {
                 node.manager_status = String::new();
             }
             Some(node)
         })
-        .collect()
+        .collect())
 }
 
 /// List all services in the Swarm.
 /// Uses a single batch `docker service inspect` to get stack labels for all services.
-pub fn list_services() -> Vec<SwarmServiceInfo> {
-    let output = match Command::new("docker")
+pub fn list_services() -> Result<Vec<SwarmServiceInfo>, String> {
+    let output = Command::new("docker")
         .args(["service", "ls", "--format", "{{json .}}"])
         .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
+        .map_err(|e| format!("Failed to run docker service ls: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("docker service ls failed: {}", stderr));
+    }
 
     let text = String::from_utf8_lossy(&output.stdout);
     let mut services: Vec<SwarmServiceInfo> = text
@@ -122,7 +137,7 @@ pub fn list_services() -> Vec<SwarmServiceInfo> {
         .collect();
 
     if services.is_empty() {
-        return services;
+        return Ok(services);
     }
 
     // Batch: fetch all stack labels in one call
@@ -133,7 +148,7 @@ pub fn list_services() -> Vec<SwarmServiceInfo> {
         }
     }
 
-    services
+    Ok(services)
 }
 
 /// Batch-fetch stack labels for all services in a single `docker service inspect` call.
@@ -194,20 +209,22 @@ fn batch_get_stack_labels(services: &[SwarmServiceInfo]) -> HashMap<String, Stri
 }
 
 /// List tasks (replicas) for a specific service.
-pub fn list_service_tasks(service_id: &str) -> Vec<SwarmTaskInfo> {
-    let output = match Command::new("docker")
+pub fn list_service_tasks(service_id: &str) -> Result<Vec<SwarmTaskInfo>, String> {
+    let output = Command::new("docker")
         .args(["service", "ps", service_id, "--format", "{{json .}}", "--no-trunc"])
         .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
+        .map_err(|e| format!("Failed to run docker service ps: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("docker service ps failed: {}", stderr));
+    }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
+    Ok(text.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+        .collect())
 }
 
 /// Force-update a service (rolling restart of all replicas).
@@ -241,10 +258,13 @@ pub fn scale_service(service_id: &str, replicas: u32) -> Result<(), String> {
     }
 }
 
-/// Start streaming service logs. Returns a receiver channel.
-/// Reads both stdout and stderr to avoid missing logs and pipe deadlocks.
-pub fn tail_service_logs(service_id: &str) -> mpsc::Receiver<String> {
+/// Start streaming service logs. Returns a `LogStreamHandle` with the receiver
+/// and a kill mechanism. Call `handle.kill()` to terminate the child process
+/// and avoid zombie processes.
+pub fn tail_service_logs(service_id: &str) -> LogStreamHandle {
     let (tx, rx) = mpsc::channel::<String>();
+    let kill_flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&kill_flag);
 
     let id = service_id.to_string();
     thread::spawn(move || {
@@ -272,9 +292,13 @@ pub fn tail_service_logs(service_id: &str) -> mpsc::Receiver<String> {
 
         // Read stdout in a separate thread
         let tx_stdout = tx.clone();
+        let flag_stdout = Arc::clone(&flag_clone);
         let stdout_handle = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
+                if flag_stdout.load(Ordering::Relaxed) {
+                    break;
+                }
                 match line {
                     Ok(l) => {
                         if tx_stdout.send(l).is_err() {
@@ -289,6 +313,9 @@ pub fn tail_service_logs(service_id: &str) -> mpsc::Receiver<String> {
         // Read stderr in the current thread
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
+            if flag_clone.load(Ordering::Relaxed) {
+                break;
+            }
             match line {
                 Ok(l) => {
                     if tx.send(l).is_err() {
@@ -299,13 +326,18 @@ pub fn tail_service_logs(service_id: &str) -> mpsc::Receiver<String> {
             }
         }
 
-        // Wait for stdout thread to finish
+        // Kill the child process explicitly to unblock any blocked I/O
+        let _ = child.kill();
+
+        // Wait for stdout thread with a timeout to avoid hanging
         let _ = stdout_handle.join();
 
-        // Clean up the child process
-        let _ = child.kill();
+        // Reap the child process
         let _ = child.wait();
     });
 
-    rx
+    LogStreamHandle {
+        receiver: rx,
+        kill_flag,
+    }
 }

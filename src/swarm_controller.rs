@@ -1,4 +1,5 @@
 use std::sync::mpsc;
+use std::thread;
 
 use crate::model::{
     SwarmMode, SwarmClusterInfo, SwarmNodeInfo, SwarmServiceInfo,
@@ -6,6 +7,7 @@ use crate::model::{
     ServiceLogState,
 };
 use crate::swarm;
+use crate::swarm::LogStreamHandle;
 
 /// Manages Docker Swarm data collection, state, and actions.
 pub struct SwarmMonitor {
@@ -17,10 +19,14 @@ pub struct SwarmMonitor {
     pub tasks: Vec<SwarmTaskInfo>,
     pub ui_state: SwarmUIState,
     pub log_state: Option<ServiceLogState>,
-    log_receiver: Option<mpsc::Receiver<String>>,
+    log_handle: Option<LogStreamHandle>,
     pub status_message: Option<String>,
     pub warnings: Vec<String>,
     pub docker_cli_available: bool,
+    /// Receiver for background action results (rolling restart, scale).
+    action_receiver: Option<mpsc::Receiver<Result<String, String>>>,
+    /// True while a background action is in flight.
+    pub action_in_progress: bool,
 }
 
 impl SwarmMonitor {
@@ -46,10 +52,12 @@ impl SwarmMonitor {
             tasks: Vec::new(),
             ui_state: SwarmUIState::default(),
             log_state: None,
-            log_receiver: None,
+            log_handle: None,
             status_message: None,
             warnings: Vec::new(),
             docker_cli_available,
+            action_receiver: None,
+            action_in_progress: false,
         }
     }
 
@@ -78,15 +86,31 @@ impl SwarmMonitor {
             return;
         }
 
-        // Only refresh cluster info every few ticks (done via detect_swarm)
-        // Nodes and services are the core data that changes
-        self.nodes = swarm::list_nodes();
-        self.services = swarm::list_services();
-        self.build_stacks();
+        match swarm::list_nodes() {
+            Ok(nodes) => self.nodes = nodes,
+            Err(e) => {
+                self.status_message = Some(format!("Error: {}", e));
+            }
+        }
+
+        match swarm::list_services() {
+            Ok(services) => {
+                self.services = services;
+                self.build_stacks();
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Error: {}", e));
+            }
+        }
 
         // Refresh tasks if we're in task view
         if let SwarmViewLevel::ServiceTasks(ref svc_id, _) = self.ui_state.view_level {
-            self.tasks = swarm::list_service_tasks(svc_id);
+            match swarm::list_service_tasks(svc_id) {
+                Ok(tasks) => self.tasks = tasks,
+                Err(e) => {
+                    self.status_message = Some(format!("Error: {}", e));
+                }
+            }
         }
 
         // Generate warnings
@@ -210,7 +234,13 @@ impl SwarmMonitor {
 
     /// Enter task view for a specific service.
     pub fn enter_task_view(&mut self, service_id: &str, service_name: &str) {
-        self.tasks = swarm::list_service_tasks(service_id);
+        match swarm::list_service_tasks(service_id) {
+            Ok(tasks) => self.tasks = tasks,
+            Err(e) => {
+                self.tasks.clear();
+                self.status_message = Some(format!("Error: {}", e));
+            }
+        }
         self.ui_state.view_level = SwarmViewLevel::ServiceTasks(
             service_id.to_string(),
             service_name.to_string(),
@@ -220,31 +250,37 @@ impl SwarmMonitor {
 
     /// Start streaming logs for a service.
     pub fn start_service_log_stream(&mut self, service_id: &str, service_name: &str) {
-        let rx = swarm::tail_service_logs(service_id);
+        // Kill any existing log stream first
+        self.stop_log_stream();
+
+        let handle = swarm::tail_service_logs(service_id);
         self.log_state = Some(ServiceLogState::new(
             service_id.to_string(),
             service_name.to_string(),
         ));
-        self.log_receiver = Some(rx);
+        self.log_handle = Some(handle);
         self.ui_state.view_level = SwarmViewLevel::ServiceLogs(
             service_id.to_string(),
             service_name.to_string(),
         );
     }
 
-    /// Stop the log stream.
+    /// Stop the log stream and kill the child process to avoid zombies.
     pub fn stop_log_stream(&mut self) {
-        self.log_receiver = None;
+        if let Some(ref handle) = self.log_handle {
+            handle.kill();
+        }
+        self.log_handle = None;
         self.log_state = None;
     }
 
     /// Drain pending log lines from the channel.
     pub fn poll_logs(&mut self) {
-        let Some(ref rx) = self.log_receiver else { return };
+        let Some(ref handle) = self.log_handle else { return };
         let Some(ref mut log_state) = self.log_state else { return };
 
         for _ in 0..200 {
-            match rx.try_recv() {
+            match handle.receiver.try_recv() {
                 Ok(line) => {
                     log_state.push_line(line);
                 }
@@ -257,26 +293,73 @@ impl SwarmMonitor {
         }
     }
 
-    /// Force-update (rolling restart) a service.
+    /// Force-update (rolling restart) a service in a background thread.
+    /// Shows "in progress" status until the operation completes.
     pub fn force_restart_service(&mut self, service_id: &str) {
-        match swarm::force_update_service(service_id) {
-            Ok(()) => {
-                self.status_message = Some(format!("Rolling restart initiated for {}", service_id));
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Error: {}", e.trim()));
-            }
+        if self.action_in_progress {
+            self.status_message = Some("An action is already in progress...".to_string());
+            return;
         }
+
+        let id = service_id.to_string();
+        let (tx, rx) = mpsc::channel();
+        self.action_receiver = Some(rx);
+        self.action_in_progress = true;
+        self.status_message = Some(format!("Rolling restart in progress for {}...", service_id));
+
+        thread::spawn(move || {
+            let result = match swarm::force_update_service(&id) {
+                Ok(()) => Ok(format!("Rolling restart initiated for {}", id)),
+                Err(e) => Err(format!("Error: {}", e.trim())),
+            };
+            let _ = tx.send(result);
+        });
     }
 
-    /// Scale a service.
+    /// Scale a service in a background thread.
     pub fn scale_service(&mut self, service_id: &str, replicas: u32) {
-        match swarm::scale_service(service_id, replicas) {
-            Ok(()) => {
-                self.status_message = Some(format!("Scaled {} to {} replicas", service_id, replicas));
+        if self.action_in_progress {
+            self.status_message = Some("An action is already in progress...".to_string());
+            return;
+        }
+
+        let id = service_id.to_string();
+        let (tx, rx) = mpsc::channel();
+        self.action_receiver = Some(rx);
+        self.action_in_progress = true;
+        self.status_message = Some(format!("Scaling {} to {} replicas...", service_id, replicas));
+
+        thread::spawn(move || {
+            let result = match swarm::scale_service(&id, replicas) {
+                Ok(()) => Ok(format!("Scaled {} to {} replicas", id, replicas)),
+                Err(e) => Err(format!("Error: {}", e.trim())),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll for background action completion. Returns true if the status changed.
+    pub fn poll_action(&mut self) -> bool {
+        let Some(ref rx) = self.action_receiver else { return false };
+        match rx.try_recv() {
+            Ok(Ok(msg)) => {
+                self.status_message = Some(msg);
+                self.action_in_progress = false;
+                self.action_receiver = None;
+                true
             }
-            Err(e) => {
-                self.status_message = Some(format!("Error: {}", e.trim()));
+            Ok(Err(msg)) => {
+                self.status_message = Some(msg);
+                self.action_in_progress = false;
+                self.action_receiver = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.status_message = Some("Action failed unexpectedly".to_string());
+                self.action_in_progress = false;
+                self.action_receiver = None;
+                true
             }
         }
     }

@@ -29,22 +29,20 @@ impl DockerClient {
     }
 
     /// List running containers and map them to our model type.
-    pub async fn list_containers(&self) -> Vec<DockerContainerInfo> {
+    pub async fn list_containers(&self) -> Result<Vec<DockerContainerInfo>, String> {
         let options: ListContainersOptions<String> = ListContainersOptions {
             all: false, // only running
             ..Default::default()
         };
 
-        let summaries = match self.client.list_containers(Some(options)).await {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let summaries = self.client.list_containers(Some(options)).await
+            .map_err(|e| format!("Failed to list containers: {}", e))?;
 
         let mut containers = Vec::new();
         for s in &summaries {
             containers.push(self.summary_to_info(s));
         }
-        containers
+        Ok(containers)
     }
 
     /// Fetch CPU stats for all containers concurrently instead of sequentially.
