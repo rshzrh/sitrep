@@ -193,7 +193,15 @@ fn calculate_cpu_percent(stats: &Stats) -> f64 {
 
     if system_delta > 0.0 && cpu_delta > 0.0 {
         let num_cpus = cpu_stats.online_cpus.unwrap_or(1) as f64;
-        (cpu_delta / system_delta) * num_cpus * 100.0
+        let pct = (cpu_delta / system_delta) * num_cpus * 100.0;
+        // Guard: on first snapshot precpu_stats can be zeroed, producing nonsensical
+        // spikes (e.g. 10,000%). Clamp to a sane maximum of 100% * num_cpus.
+        let max_pct = num_cpus * 100.0;
+        if pct > max_pct {
+            0.0
+        } else {
+            pct
+        }
     } else {
         0.0
     }

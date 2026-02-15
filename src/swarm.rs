@@ -37,6 +37,17 @@ struct DockerInfoPartial {
     swarm: Option<DockerInfoSwarm>,
 }
 
+/// Check if the `docker` CLI binary is available in PATH.
+pub fn is_docker_cli_available() -> bool {
+    Command::new("docker")
+        .arg("version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Detect whether Docker is in Swarm mode by querying `docker info`.
 /// Returns Some(SwarmClusterInfo) if swarm is active, None otherwise.
 pub fn detect_swarm() -> Option<SwarmClusterInfo> {
@@ -167,9 +178,12 @@ fn batch_get_stack_labels(services: &[SwarmServiceInfo]) -> HashMap<String, Stri
             } else {
                 label.to_string()
             };
-            // Match by short ID prefix (docker inspect returns full IDs)
+            // Match: `docker service inspect` returns full 64-char IDs,
+            // `docker service ls` returns short ~12-char IDs.
+            // One-directional: full_id.starts_with(short_id), with a minimum
+            // length guard of 10 chars to avoid ambiguous prefix collisions.
             for svc_id in &ids {
-                if id.starts_with(svc_id) || svc_id.starts_with(id) {
+                if svc_id.len() >= 10 && id.starts_with(svc_id) {
                     result.insert(svc_id.to_string(), label.clone());
                     break;
                 }

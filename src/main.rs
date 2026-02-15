@@ -87,6 +87,9 @@ fn main() -> io::Result<()> {
     let mut app_view = AppView::System;
     let mut tick_counter: u64 = 0; // counts 3s ticks
     let mut pending_action: Option<PendingAction> = None;
+    let min_refresh_interval = Duration::from_millis(500);
+    let mut last_tab_refresh = Instant::now() - min_refresh_interval;
+    let mut prev_app_view = app_view.clone();
 
     loop {
         // Check for OS signals (SIGTERM, SIGINT)
@@ -156,8 +159,37 @@ fn main() -> io::Result<()> {
             }
         }
 
+        // --- Immediate refresh on tab switch (avoid stale data) ---
+        if app_view != prev_app_view {
+            let since_last = now.duration_since(last_tab_refresh);
+            if since_last >= min_refresh_interval {
+                match &app_view {
+                    AppView::System => { monitor.update(); }
+                    AppView::Containers | AppView::ContainerLogs(_) => {
+                        if docker_monitor.is_available() { docker_monitor.update(); }
+                    }
+                    AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
+                        if swarm_monitor.is_swarm() { swarm_monitor.update(); }
+                    }
+                }
+                last_tab_refresh = now;
+            }
+            prev_app_view = app_view.clone();
+            needs_render = true;
+        }
+
         // --- Render ---
         if needs_render {
+            // Check minimum terminal size
+            if Presenter::render_size_guard()? {
+                needs_render = false;
+                // Still need to handle input so we don't skip the event loop
+                let timeout = tick_rate.saturating_sub(now.elapsed());
+                if event::poll(timeout.min(Duration::from_millis(100)))? {
+                    let _ = event::read()?; // consume event
+                }
+                continue;
+            }
             let time_str = monitor.last_data.as_ref()
                 .map(|d| d.time.clone())
                 .unwrap_or_else(|| "...".to_string());

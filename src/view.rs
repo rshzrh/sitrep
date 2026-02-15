@@ -22,7 +22,34 @@ pub enum RowKind {
 
 pub struct Presenter;
 
+/// Minimum terminal dimensions for usable rendering.
+pub const MIN_COLS: u16 = 80;
+pub const MIN_ROWS: u16 = 10;
+
 impl Presenter {
+    /// Check if the terminal is large enough. If not, render a "too small"
+    /// message and return `true` (meaning "skip normal rendering").
+    pub fn render_size_guard() -> io::Result<bool> {
+        let (cols, rows) = terminal::size()?;
+        if cols < MIN_COLS || rows < MIN_ROWS {
+            let mut out = stdout();
+            execute!(out, Clear(ClearType::All), cursor::MoveTo(0, 0))?;
+            let msg = format!(
+                "Terminal too small ({}x{}). Resize to at least {}x{}.",
+                cols, rows, MIN_COLS, MIN_ROWS
+            );
+            // Center the message vertically
+            let y = rows / 2;
+            let x = cols.saturating_sub(msg.len() as u16) / 2;
+            queue!(out, cursor::MoveTo(x, y), SetForegroundColor(Color::Yellow))?;
+            write!(out, "{}", msg)?;
+            queue!(out, ResetColor)?;
+            out.flush()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     // =====================================================================
     // Tab bar (rendered at the top of every view except full-screen logs)
     // =====================================================================

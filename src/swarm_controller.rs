@@ -20,11 +20,17 @@ pub struct SwarmMonitor {
     log_receiver: Option<mpsc::Receiver<String>>,
     pub status_message: Option<String>,
     pub warnings: Vec<String>,
+    pub docker_cli_available: bool,
 }
 
 impl SwarmMonitor {
     pub fn new() -> Self {
-        let cluster_info = swarm::detect_swarm();
+        let docker_cli_available = swarm::is_docker_cli_available();
+        let cluster_info = if docker_cli_available {
+            swarm::detect_swarm()
+        } else {
+            None
+        };
         let mode = if cluster_info.is_some() {
             SwarmMode::Swarm
         } else {
@@ -43,6 +49,7 @@ impl SwarmMonitor {
             log_receiver: None,
             status_message: None,
             warnings: Vec::new(),
+            docker_cli_available,
         }
     }
 
@@ -53,6 +60,10 @@ impl SwarmMonitor {
     /// Recheck swarm mode (called infrequently, e.g. every 30s, when standalone)
     pub fn recheck_swarm(&mut self) {
         if self.is_swarm() {
+            return;
+        }
+        self.docker_cli_available = swarm::is_docker_cli_available();
+        if !self.docker_cli_available {
             return;
         }
         self.cluster_info = swarm::detect_swarm();
@@ -119,6 +130,11 @@ impl SwarmMonitor {
     /// Generate smart warnings about cluster health.
     fn generate_warnings(&mut self) {
         self.warnings.clear();
+
+        if !self.docker_cli_available {
+            self.warnings.push("docker CLI not found in PATH — Swarm data unavailable".to_string());
+            return;
+        }
 
         // Check for down nodes
         let down_nodes: Vec<&str> = self.nodes.iter()
