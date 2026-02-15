@@ -241,10 +241,11 @@ If Docker is not in Swarm mode, or `sitrep` is running on a worker node, the Swa
 
 ```
 src/
-├── main.rs              # Application loop, tab switching & input handling
-├── model.rs             # Data structures (system + Docker + Swarm)
-├── view.rs              # Terminal rendering (tab bar, system, containers, swarm, logs)
-├── controller.rs        # System data collection & processing
+├── main.rs              # Thin entry point (panic hook, signals, app::run)
+├── app/                 # Application loop, input, render, event loop
+├── model/               # Data structures (system + Docker + Swarm)
+├── view/                # Terminal rendering (tab bar, system, containers, swarm, logs)
+├── controller/          # System data collection & processing
 ├── layout.rs            # Section layout system (collapsible sections)
 ├── docker.rs            # Docker API client (bollard wrapper)
 ├── docker_controller.rs # Docker data collection & log streaming
