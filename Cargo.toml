@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["monitoring", "diagnostics", "terminal", "devops", "tui"]
 categories = ["command-line-utilities", "os"]
 
+[lib]
+name = "sitrep"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sitrep"
 path = "src/main.rs"

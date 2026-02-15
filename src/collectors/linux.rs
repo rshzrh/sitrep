@@ -206,7 +206,9 @@ impl SystemCollector for LinuxCollector {
     /// The field `io_ticks` counts the number of milliseconds during which
     /// the device had I/O in progress.  By comparing two snapshots we get:
     ///
-    ///     busy% = delta_io_ticks / elapsed_ms × 100
+    /// ```text
+    /// busy% = delta_io_ticks / elapsed_ms * 100
+    /// ```
     ///
     /// We report the *maximum* busy% across all block devices so that a
     /// single saturated disk is immediately visible.

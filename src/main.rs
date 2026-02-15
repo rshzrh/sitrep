@@ -1,13 +1,3 @@
-pub mod model;
-pub mod view;
-pub mod controller;
-pub mod layout;
-pub mod collectors;
-pub mod docker;
-pub mod docker_controller;
-pub mod swarm;
-pub mod swarm_controller;
-
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,11 +7,11 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers, KeyEvent},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
-use controller::Monitor;
-use docker_controller::DockerMonitor;
-use swarm_controller::SwarmMonitor;
-use model::{AppView, SortColumn, SwarmViewLevel};
-use view::{Presenter, RowKind};
+use sitrep::controller::Monitor;
+use sitrep::docker_controller::DockerMonitor;
+use sitrep::swarm_controller::SwarmMonitor;
+use sitrep::model::{AppView, SortColumn, SwarmViewLevel};
+use sitrep::view::{Presenter, RowKind};
 use sysinfo::Pid;
 
 /// Restore the terminal to normal mode. Safe to call multiple times.
