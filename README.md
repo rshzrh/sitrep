@@ -2,7 +2,7 @@
 
 **Situation Report** — A real-time terminal diagnostic tool for server triage.
 
-When your server is busy and not responding, `sitrep` gives you the full picture at a glance: CPU, memory, disk, network, file descriptors, context switches, socket health, and Docker containers — all in one interactive terminal UI.
+When your server is busy and not responding, `sitrep` gives you the full picture at a glance: CPU, memory, disk, network, file descriptors, context switches, socket health, Docker containers, and **Docker Swarm clusters** — all in one interactive terminal UI.
 
 ## Features
 
@@ -27,8 +27,20 @@ When your server is busy and not responding, `sitrep` gives you the full picture
   - **Expandable Details**: View image, full status, port mappings, and network info per container.
   - **Auto-hide**: The Containers tab is hidden when Docker is not installed or the daemon is not running.
 
+- **Docker Swarm Cluster** (auto-detected):
+  - **Automatic Detection**: `sitrep` detects Swarm mode automatically — no configuration needed.
+  - **Cluster Overview**: Node count, manager count, node status (Ready/Down), availability (Active/Drain).
+  - **Service & Stack Grouping**: Services grouped by stack (`com.docker.stack.namespace` label) with expandable drill-down.
+  - **Task/Replica List**: View all replicas of a service with current state, desired state, node placement, and errors.
+  - **Service Logs**: Full-screen aggregated log viewer across all replicas of a service with auto-follow.
+  - **Error Filtering**: Toggle error-only mode (`e` key) to surface `ERROR`, `panic`, `fatal`, and `exception` messages.
+  - **Rolling Restart**: Force-restart all replicas of a service (`R` key) via `docker service update --force`.
+  - **Smart Warnings**: Automatic alerts for down nodes, drained nodes, degraded services, and insufficient manager count.
+  - **Auto-hide**: The Swarm tab only appears when running on a Swarm manager node.
+
 - **Interactivity**:
-  - **Tab Switching**: `Tab` / `Shift+Tab` to switch between System and Containers views.
+  - **View Titles**: Each view displays a clear title at the top (System, Containers, Swarm Cluster, etc.) so you always know which tab you're in.
+  - **Tab Switching**: `Tab` / `Shift+Tab` to cycle between System, Containers, and Swarm views.
   - **Navigation**: Arrow keys to scroll and expand/collapse.
   - **Sorting**: Keys `c`, `m`, `r`, `w`, `d`, `u` to sort the process list.
   - **Pause**: Spacebar to pause/resume updates.
@@ -73,7 +85,8 @@ sitrep
 #### Global
 
 - `q` / `Esc`: Quit
-- `Tab`: Switch to next tab (System / Containers)
+- `Ctrl+C`: Force quit
+- `Tab`: Switch to next tab (System → Containers → Swarm)
 - `Shift+Tab`: Switch to previous tab
 
 #### System Tab
@@ -95,14 +108,38 @@ sitrep
 - `←`: Expand/collapse container details (image, ports, IP)
 - `s`: Start the selected container
 - `t`: Stop the selected container
-- `r`: Restart the selected container
+- `r`: Restart the selected container (confirm with `y`, cancel with `n` or `Esc`)
 
-#### Log Viewer (full-screen)
+#### Container Log Viewer (full-screen)
 
 - `Esc` / `←`: Return to container list
 - `↑ / ↓`: Scroll through log history (pauses auto-follow)
 - `PageUp / PageDown`: Scroll by page
 - `f` / `End`: Resume auto-follow
+- `/`: Search mode (type query, Enter to confirm, Esc to cancel)
+
+#### Swarm Tab — Overview
+
+- `↑ / ↓`: Navigate nodes, stacks, and services
+- `→`: Expand section / drill into service tasks
+- `←`: Collapse section / go back
+- `R`: Rolling restart the selected service (confirm with `y`, cancel with `n` or `Esc`)
+
+#### Swarm Tab — Task/Replica List
+
+- `↑ / ↓`: Navigate tasks
+- `→` / `L`: Open service log viewer
+- `R`: Rolling restart the service (confirm with `y`, cancel with `n` or `Esc`)
+- `Esc` / `←`: Back to overview
+
+#### Service Log Viewer (full-screen)
+
+- `Esc` / `←`: Return to Swarm overview
+- `↑ / ↓`: Scroll through log history (pauses auto-follow)
+- `PageUp / PageDown`: Scroll by page
+- `f` / `End`: Resume auto-follow
+- `e`: Toggle error-only filter (shows ERROR, panic, fatal, exception lines)
+- `/`: Search mode (type query, Enter to confirm, Esc to cancel)
 
 
 ## Docker Integration
@@ -136,6 +173,7 @@ Press `→` on any container to enter a full-screen log viewer:
 - Auto-scrolls to the latest output by default.
 - Press `↑` or `↓` to pause auto-follow and scroll through history.
 - Press `f` or `End` to resume following.
+- Press `/` to search (type query, Enter to confirm, Esc to cancel).
 - Press `Esc` or `←` to return to the container list.
 
 ### Container actions
@@ -146,30 +184,107 @@ From the container list, you can manage containers directly:
 - `t` — **Stop** a running container (10-second graceful timeout)
 - `r` — **Restart** a container (10-second graceful timeout)
 
-Action feedback is displayed as a status message in the container view.
+Destructive actions (stop, restart) require confirmation: press `y` to confirm or `n` / `Esc` to cancel. Action feedback is displayed as a status message in the container view.
 
 ### When Docker is unavailable
 
 If Docker is not installed, the daemon is not running, or the socket is not accessible, the Containers tab is simply hidden. No error is shown and the System tab works as normal.
 
+## Docker Swarm Integration
+
+`sitrep` includes built-in Docker Swarm cluster monitoring. If the current node is part of a Swarm cluster and is a **manager node**, a **Swarm** tab appears automatically alongside the Containers tab.
+
+### Requirements
+
+- Docker Engine running in **Swarm mode** (`docker swarm init` or `docker swarm join`).
+- `sitrep` must be run on a **manager node** (workers don't have access to the full cluster API).
+- The `docker` CLI must be available in `$PATH`.
+
+### How it works
+
+`sitrep` automatically detects Swarm mode by querying `docker info`. When Swarm is active:
+
+1. **Cluster Overview**: Shows all nodes with status, availability, role, and engine version. Down or drained nodes are highlighted in red/yellow.
+2. **Stack Grouping**: Services are automatically grouped by their stack name (from the `com.docker.stack.namespace` label). Services not part of a stack are shown under "(no stack)".
+3. **Service Drill-down**: Press `→` on a service to see all its tasks/replicas with node placement, desired state, current state, and any error messages. Failed/rejected tasks are highlighted in red, running tasks in green.
+4. **Aggregated Service Logs**: Press `→` or `L` from the task list to open a full-screen log viewer that streams logs from **all replicas** of the service (`docker service logs --follow`).
+5. **Error Filtering**: Press `e` in the log viewer to filter to only lines containing `error`, `panic`, `fatal`, `exception`, or `fail`.
+6. **Search**: Press `/` in the log viewer to search for text (Enter to confirm, Esc to cancel).
+
+### Smart warnings
+
+`sitrep` automatically generates warnings for common cluster issues:
+
+| Warning | Condition |
+|---|---|
+| **NODE DOWN** | One or more nodes are unreachable |
+| **DRAINED** | Nodes in drain mode (won't accept new tasks) |
+| **SERVICE DEGRADED** | Service has fewer running replicas than desired (e.g. 2/3) |
+| **LOW MANAGERS** | Fewer than 3 managers in a cluster with more than 3 nodes |
+
+### Service actions
+
+From the Swarm overview or task list:
+
+- `R` — **Rolling restart**: Force-updates the service (`docker service update --force`), which triggers a rolling restart of all replicas according to the service's update configuration. Press `y` to confirm or `n` / `Esc` to cancel.
+
+### Typical workflow
+
+1. Launch `sitrep` on a Swarm manager node
+2. Press `Tab` to reach the **Swarm** tab
+3. Expand a stack with `→` to see its services
+4. Press `→` on a service to see all replicas and which nodes they're running on
+5. Press `→` or `L` to tail aggregated logs across all replicas
+6. Press `e` to filter for error messages
+7. Press `R` to rolling restart the service if needed
+8. Press `Esc` to navigate back up the hierarchy
+
+### When Swarm is unavailable
+
+If Docker is not in Swarm mode, or `sitrep` is running on a worker node, the Swarm tab is hidden. The System and Containers tabs continue to work normally.
+
 ## Architecture
 
 ```
 src/
-├── main.rs              # Application loop, tab switching & input handling
-├── model.rs             # Data structures (system + Docker)
-├── view.rs              # Terminal rendering (tab bar, system, containers, logs)
-├── controller.rs        # System data collection & processing
+├── main.rs              # Thin entry point (panic hook, signals, app::run)
+├── app/                 # Application orchestration
+│   ├── mod.rs           # App struct, main loop, run()
+│   ├── event_loop.rs   # Tick refresh, log polling, action polling, tab-switch refresh
+│   ├── input.rs        # Key handling, view-specific handlers
+│   ├── render.rs       # Render dispatch by AppView
+│   └── state.rs        # PendingAction, SwarmOverviewItem, resolve_swarm_overview_item
+├── model/               # Data structures (system + Docker + Swarm)
+│   ├── app.rs          # AppView enum
+│   ├── system.rs       # MonitorData, UIState, ProcessGroup, etc.
+│   ├── docker.rs       # DockerContainerInfo, LogViewState, ContainerUIState
+│   └── swarm.rs        # SwarmNodeInfo, SwarmServiceInfo, SwarmUIState, etc.
+├── view/                # Terminal rendering
+│   ├── mod.rs          # Presenter, RowKind
+│   ├── tab_bar.rs      # Tab bar with view titles
+│   ├── system.rs       # System report (sections, processes)
+│   ├── containers.rs   # Container list
+│   ├── swarm.rs        # Swarm overview, tasks
+│   ├── logs.rs         # Container + service logs
+│   ├── confirmation.rs # Pending action prompt
+│   └── shared.rs       # truncate_str, progress_bar, etc.
+├── controller/          # System data collection & processing
+│   ├── mod.rs          # Monitor, update()
+│   └── process.rs      # Process grouping, compute_top_processes
 ├── layout.rs            # Section layout system (collapsible sections)
 ├── docker.rs            # Docker API client (bollard wrapper)
 ├── docker_controller.rs # Docker data collection & log streaming
+├── swarm.rs             # Swarm CLI client (node, service, task, log operations)
+├── swarm_controller.rs  # Swarm data collection, state management & actions
 └── collectors/
     ├── mod.rs           # Platform collector trait
     ├── mac.rs           # macOS-specific collector
     └── linux.rs         # Linux-specific collector
 ```
 
-MVC architecture with a reusable `Layout` system for defining report sections. Docker integration uses a separate `DockerMonitor` backed by the [bollard](https://crates.io/crates/bollard) crate, communicating with the Docker daemon over the local Unix socket.
+MVC architecture with a reusable `Layout` system for defining report sections. Docker container integration uses [bollard](https://crates.io/crates/bollard) (async Docker API) for standalone containers. Swarm integration uses the `docker` CLI with JSON output for cluster-wide operations (nodes, services, tasks, service logs).
+
+For a detailed technical breakdown of data flow, sequence diagrams, and component responsibilities, see [Architecture.md](Architecture.md).
 
 ## Roadmap
 
@@ -190,6 +305,7 @@ The #1 priority. `sitrep` currently uses macOS-specific system commands (`iostat
 - [ ] **GPU monitoring** — NVIDIA (`nvidia-smi`) and Apple Silicon GPU usage
 - [ ] **Per-disk I/O breakdown** — show read/write rates per individual disk, not just aggregate busy %
 - [x] **Container awareness** — Docker container monitoring with live stats, log tailing, and start/stop/restart actions
+- [x] **Swarm cluster monitoring** — Automatic Swarm detection, node/service/task views, aggregated service logs, error filtering, rolling restarts, and smart warnings
 - [ ] **Alerting & thresholds** — configurable warning thresholds (not just the hardcoded 10% disk), with optional desktop notifications
 - [ ] **Process tree view** — full hierarchical process tree with fold/unfold, not just parent grouping
 - [ ] **Historical sparklines** — tiny inline graphs showing trends for CPU, memory, and network over the last few minutes

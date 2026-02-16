@@ -5,6 +5,7 @@ use bollard::container::{
 };
 use bollard::models::ContainerSummary;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use tokio::sync::mpsc;
 
 use crate::model::DockerContainerInfo;
@@ -28,23 +29,28 @@ impl DockerClient {
     }
 
     /// List running containers and map them to our model type.
-    pub async fn list_containers(&self) -> Vec<DockerContainerInfo> {
+    pub async fn list_containers(&self) -> Result<Vec<DockerContainerInfo>, String> {
         let options: ListContainersOptions<String> = ListContainersOptions {
             all: false, // only running
             ..Default::default()
         };
 
-        let summaries = match self.client.list_containers(Some(options)).await {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let summaries = self.client.list_containers(Some(options)).await
+            .map_err(|e| format!("Failed to list containers: {}", e))?;
 
         let mut containers = Vec::new();
-        for s in summaries {
-            let info = self.summary_to_info(&s).await;
-            containers.push(info);
+        for s in &summaries {
+            containers.push(self.summary_to_info(s));
         }
-        containers
+        Ok(containers)
+    }
+
+    /// Fetch CPU stats for all containers concurrently instead of sequentially.
+    pub async fn get_all_cpu_percents(&self, ids: &[String]) -> Vec<f64> {
+        let futures: Vec<_> = ids.iter()
+            .map(|id| self.get_cpu_percent(id))
+            .collect();
+        join_all(futures).await
     }
 
     /// Fetch a one-shot stats snapshot for a container. Returns cpu_percent.
@@ -138,7 +144,7 @@ impl DockerClient {
 
     // --- Internal helpers ---
 
-    async fn summary_to_info(&self, s: &ContainerSummary) -> DockerContainerInfo {
+    fn summary_to_info(&self, s: &ContainerSummary) -> DockerContainerInfo {
         let id_full = s.id.clone().unwrap_or_default();
         let id_short = id_full.chars().take(12).collect::<String>();
 
@@ -185,7 +191,15 @@ fn calculate_cpu_percent(stats: &Stats) -> f64 {
 
     if system_delta > 0.0 && cpu_delta > 0.0 {
         let num_cpus = cpu_stats.online_cpus.unwrap_or(1) as f64;
-        (cpu_delta / system_delta) * num_cpus * 100.0
+        let pct = (cpu_delta / system_delta) * num_cpus * 100.0;
+        // Guard: on first snapshot precpu_stats can be zeroed, producing nonsensical
+        // spikes (e.g. 10,000%). Clamp to a sane maximum of 100% * num_cpus.
+        let max_pct = num_cpus * 100.0;
+        if pct > max_pct {
+            0.0
+        } else {
+            pct
+        }
     } else {
         0.0
     }

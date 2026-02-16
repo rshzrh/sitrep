@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["monitoring", "diagnostics", "terminal", "devops", "tui"]
 categories = ["command-line-utilities", "os"]
 
+[lib]
+name = "sitrep"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sitrep"
 path = "src/main.rs"
@@ -21,3 +25,6 @@ sysinfo = "0.38.1"
 bollard = "0.18"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"

@@ -5,25 +5,61 @@ use crate::model::{
 use sysinfo::Pid;
 use std::collections::HashMap;
 use std::process::Command;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 pub struct MacCollector {
-    // We might need state here if we want to cache things, but for now we follow controller's stateless usage (mostly).
-    // Controller had `prev_net_snapshot`? No, it was in Monitor struct.
-    // `collect_process_network_stats` in controller was static function?
-    // Let's check line 423 of controller.rs: `fn collect_process_network_stats() -> ...` (no self).
-    // So it was stateless.
+    /// Cached nettop results, updated by a background thread every ~2 seconds.
+    nettop_cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>>,
 }
 
 impl MacCollector {
     pub fn new() -> Self {
-        Self {}
+        let cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
+        let cache_clone = Arc::clone(&cache);
+
+        // Spawn a background thread that continuously runs nettop and updates the cache.
+        thread::spawn(move || {
+            loop {
+                let stats = run_nettop();
+                if let Ok(mut guard) = cache_clone.lock() {
+                    *guard = stats;
+                }
+                thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        Self { nettop_cache: cache }
     }
 
     fn parse_sysctl_value(output: &str) -> u64 {
-        // sysctl output: "kern.maxfiles: 122880"
         output.split(":").nth(1).unwrap_or("0").trim().parse().unwrap_or(0)
     }
+}
+
+/// Run nettop once and return per-PID network stats.
+fn run_nettop() -> HashMap<Pid, (u64, u64)> {
+    let mut stats = HashMap::new();
+    if let Ok(output) = Command::new("nettop").args(["-P", "-L", "1"]).output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines().skip(1) {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 6 {
+                if let Some(name_pid) = parts.get(1) {
+                    if let Some(last_dot) = name_pid.rfind('.') {
+                        if let Ok(pid_val) = name_pid[last_dot+1..].parse::<u32>() {
+                            let pid = Pid::from(pid_val as usize);
+                            let bytes_in = parts.get(4).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
+                            let bytes_out = parts.get(5).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
+                            stats.insert(pid, (bytes_in, bytes_out));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    stats
 }
 
 impl SystemCollector for MacCollector {
@@ -156,36 +192,7 @@ impl SystemCollector for MacCollector {
     }
 
     fn get_process_network_stats(&mut self) -> HashMap<Pid, (u64, u64)> {
-        let mut stats = HashMap::new();
-        // nettop -P -L 1 -J bytes_in,bytes_out
-        // Controller used args ["-P", "-L", "1"] and split by comma.
-        // And parsed index 4 and 5?
-        // In the snippet 427: `Command::new("nettop").args(["-P", "-L", "1"])`
-        // And parsed: `parts.get(4)`/`parts.get(5)`.
-        
-        if let Ok(output) = Command::new("nettop").args(["-P", "-L", "1"]).output() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines().skip(1) {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 6 {
-                     if let Some(name_pid) = parts.get(1) {
-                         if let Some(last_dot) = name_pid.rfind('.') {
-                             // "name.pid" format
-                             if let Ok(pid_val) = name_pid[last_dot+1..].parse::<u32>() {
-                                 // sysinfo uses Pid which is likely wrapper around number or platform specific.
-                                 // On unix Pid is usually i32/u32.
-                                 // sysinfo::Pid::from(pid_val as usize) ?
-                                 let pid = Pid::from(pid_val as usize);
-                                 
-                                 let bytes_in = parts.get(4).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
-                                 let bytes_out = parts.get(5).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
-                                 stats.insert(pid, (bytes_in, bytes_out));
-                             }
-                         }
-                     }
-                }
-            }
-        }
-        stats
+        // Read cached results from the background nettop thread — no blocking!
+        self.nettop_cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
