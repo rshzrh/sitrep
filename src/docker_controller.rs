@@ -14,6 +14,8 @@ type ActionReceiver = std::sync::mpsc::Receiver<Result<String, String>>;
 pub struct DockerMonitor {
     client: Option<DockerClient>,
     pub containers: Vec<DockerContainerInfo>,
+    cpu_cache: HashMap<String, f64>,
+    cpu_refresh_cursor: usize,
     pub ui_state: ContainerUIState,
     pub log_states: HashMap<String, LogViewState>,
     pub multi_log_state: Option<MultiLogViewState>,
@@ -40,6 +42,8 @@ impl DockerMonitor {
         Self {
             client: if docker_available { client } else { None },
             containers: Vec::new(),
+            cpu_cache: HashMap::new(),
+            cpu_refresh_cursor: 0,
             ui_state: ContainerUIState::default(),
             log_states: HashMap::new(),
             multi_log_state: None,
@@ -59,12 +63,45 @@ impl DockerMonitor {
 
         match self.rt.block_on(client.list_containers()) {
             Ok(mut containers) => {
-                // Fetch CPU stats for all containers concurrently
                 let ids: Vec<String> = containers.iter().map(|c| c.id.clone()).collect();
-                let cpu_percents = self.rt.block_on(client.get_all_cpu_percents(&ids));
-                for (c, cpu) in containers.iter_mut().zip(cpu_percents.into_iter()) {
-                    c.cpu_percent = cpu;
+
+                // Reuse recent CPU values for the full list, then refresh a
+                // small rotating subset to avoid one stats call per container
+                // on every tick.
+                for c in &mut containers {
+                    c.cpu_percent = *self.cpu_cache.get(&c.id).unwrap_or(&0.0);
                 }
+
+                const CPU_REFRESH_BATCH_SIZE: usize = 4;
+                if !ids.is_empty() {
+                    let start = self.cpu_refresh_cursor.min(ids.len());
+                    let end = (start + CPU_REFRESH_BATCH_SIZE).min(ids.len());
+                    let refresh_ids = if start < end {
+                        &ids[start..end]
+                    } else {
+                        &ids[..ids.len().min(CPU_REFRESH_BATCH_SIZE)]
+                    };
+
+                    let refresh_ids_vec: Vec<String> = refresh_ids.to_vec();
+                    let cpu_percents = self.rt.block_on(client.get_all_cpu_percents(&refresh_ids_vec));
+                    for (id, cpu) in refresh_ids.iter().zip(cpu_percents.into_iter()) {
+                        self.cpu_cache.insert(id.clone(), cpu);
+                    }
+
+                    self.cpu_refresh_cursor = if end >= ids.len() {
+                        0
+                    } else {
+                        end
+                    };
+                } else {
+                    self.cpu_refresh_cursor = 0;
+                }
+
+                self.cpu_cache.retain(|id, _| ids.contains(id));
+                for c in &mut containers {
+                    c.cpu_percent = *self.cpu_cache.get(&c.id).unwrap_or(&c.cpu_percent);
+                }
+
                 self.containers = containers;
             }
             Err(e) => {
