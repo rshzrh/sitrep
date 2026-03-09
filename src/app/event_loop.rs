@@ -18,7 +18,7 @@ impl App {
             AppView::System => {
                 self.monitor.update();
             }
-            AppView::Containers | AppView::ContainerLogs(_) => {
+            AppView::Containers | AppView::ContainerLogs(_) | AppView::ContainerLogsMulti(_) => {
                 if self.docker_monitor.is_available() {
                     self.docker_monitor.update();
                 }
@@ -43,21 +43,55 @@ impl App {
         let mut needs_render = false;
 
         if matches!(self.app_view, AppView::ContainerLogs(_)) {
-            let had_lines = self.docker_monitor.log_state.as_ref()
-                .map(|s| s.lines.len()).unwrap_or(0);
+            if let AppView::ContainerLogs(container_id) = &self.app_view {
+                let had_lines = self
+                    .docker_monitor
+                    .get_log_state(container_id)
+                    .map(|s| s.lines.len())
+                    .unwrap_or(0);
+                self.docker_monitor.poll_logs();
+                let has_lines = self
+                    .docker_monitor
+                    .get_log_state(container_id)
+                    .map(|s| s.lines.len())
+                    .unwrap_or(0);
+                if has_lines != had_lines {
+                    needs_render = true;
+                }
+            }
+        }
+        if matches!(self.app_view, AppView::ContainerLogsMulti(_)) {
+            let had_total = self
+                .docker_monitor
+                .multi_log_state
+                .as_ref()
+                .map(|s| s.lines.len())
+                .unwrap_or(0);
             self.docker_monitor.poll_logs();
-            let has_lines = self.docker_monitor.log_state.as_ref()
-                .map(|s| s.lines.len()).unwrap_or(0);
-            if has_lines != had_lines {
+            let has_total = self
+                .docker_monitor
+                .multi_log_state
+                .as_ref()
+                .map(|s| s.lines.len())
+                .unwrap_or(0);
+            if has_total != had_total || (has_total > 0 && had_total == 0) {
                 needs_render = true;
             }
         }
         if matches!(self.app_view, AppView::SwarmServiceLogs(_, _)) {
-            let had_lines = self.swarm_monitor.log_state.as_ref()
-                .map(|s| s.lines.len()).unwrap_or(0);
+            let had_lines = self
+                .swarm_monitor
+                .log_state
+                .as_ref()
+                .map(|s| s.lines.len())
+                .unwrap_or(0);
             self.swarm_monitor.poll_logs();
-            let has_lines = self.swarm_monitor.log_state.as_ref()
-                .map(|s| s.lines.len()).unwrap_or(0);
+            let has_lines = self
+                .swarm_monitor
+                .log_state
+                .as_ref()
+                .map(|s| s.lines.len())
+                .unwrap_or(0);
             if has_lines != had_lines {
                 needs_render = true;
             }
@@ -88,12 +122,16 @@ impl App {
                     AppView::System => {
                         self.monitor.update();
                     }
-                    AppView::Containers | AppView::ContainerLogs(_) => {
+                    AppView::Containers
+                    | AppView::ContainerLogs(_)
+                    | AppView::ContainerLogsMulti(_) => {
                         if self.docker_monitor.is_available() {
                             self.docker_monitor.update();
                         }
                     }
-                    AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
+                    AppView::Swarm
+                    | AppView::SwarmServiceTasks(_, _)
+                    | AppView::SwarmServiceLogs(_, _) => {
                         if self.swarm_monitor.is_swarm() {
                             self.swarm_monitor.update();
                         }

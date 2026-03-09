@@ -1,11 +1,17 @@
-use std::io::{self, Write, stdout};
-use crossterm::{cursor::MoveTo, queue, style::{Color, SetForegroundColor, ResetColor, SetAttribute, Attribute, Print}};
+use crossterm::{
+    cursor::MoveTo,
+    queue,
+    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+};
+use std::io::{self, stdout, Write};
 use sysinfo::Pid;
 
+use super::shared::{
+    format_bytes_rate, format_number, progress_bar, write_section_header, write_selectable, writeln,
+};
+use super::RowKind;
 use crate::layout::{Layout, SectionId};
 use crate::model::{MonitorData, SortColumn, UIState};
-use super::shared::{writeln, write_section_header, write_selectable, format_bytes_rate, progress_bar, format_number};
-use super::RowKind;
 
 pub fn render(
     data: &MonitorData,
@@ -19,7 +25,10 @@ pub fn render(
     queue!(out, SetAttribute(Attribute::Bold))?;
     writeln(&mut out, "  System")?;
     queue!(out, SetAttribute(Attribute::Reset))?;
-    writeln(&mut out, &format!("  {}  |  Cores: {}", data.time, data.core_count))?;
+    writeln(
+        &mut out,
+        &format!("  {}  |  Cores: {}", data.time, data.core_count),
+    )?;
     writeln(&mut out, "")?;
 
     for section in &layout.sections {
@@ -77,7 +86,10 @@ pub fn render(
 }
 
 fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
-    writeln(out, "────────────────────────────────────────────────────────────────────────────────")?;
+    writeln(
+        out,
+        "────────────────────────────────────────────────────────────────────────────────",
+    )?;
 
     let (l1, l5, l15) = data.load_avg;
     let cores = data.core_count;
@@ -108,7 +120,11 @@ fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
     let total_gb = m.total as f64 / 1_073_741_824.0;
     let used_gb = m.used as f64 / 1_073_741_824.0;
     let avail_gb = m.available as f64 / 1_073_741_824.0;
-    let pct_used = if m.total > 0 { (m.used as f64 / m.total as f64) * 100.0 } else { 0.0 };
+    let pct_used = if m.total > 0 {
+        (m.used as f64 / m.total as f64) * 100.0
+    } else {
+        0.0
+    };
 
     let mem_bar = progress_bar(pct_used, 20);
     let mem_color = if pct_used > 85.0 {
@@ -118,10 +134,13 @@ fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
     } else {
         ""
     };
-    writeln(out, &format!(
-        "MEM    {}{}\x1b[0m {:.1}/{:.1} GB ({:.0}%)  │ avail: {:.1} GB",
-        mem_color, mem_bar, used_gb, total_gb, pct_used, avail_gb
-    ))?;
+    writeln(
+        out,
+        &format!(
+            "MEM    {}{}\x1b[0m {:.1}/{:.1} GB ({:.0}%)  │ avail: {:.1} GB",
+            mem_color, mem_bar, used_gb, total_gb, pct_used, avail_gb
+        ),
+    )?;
 
     if m.swap_total > 0 {
         let swap_total_gb = m.swap_total as f64 / 1_073_741_824.0;
@@ -136,10 +155,13 @@ fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
         } else {
             ""
         };
-        writeln(out, &format!(
-            "SWAP   {}{}\x1b[0m {:.1}/{:.1} GB ({:.0}%)",
-            swap_color, swap_bar, swap_used_gb, swap_total_gb, swap_pct
-        ))?;
+        writeln(
+            out,
+            &format!(
+                "SWAP   {}{}\x1b[0m {:.1}/{:.1} GB ({:.0}%)",
+                swap_color, swap_bar, swap_used_gb, swap_total_gb, swap_pct
+            ),
+        )?;
     } else {
         writeln(out, "SWAP   none")?;
     }
@@ -161,17 +183,24 @@ fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
                 ""
             };
 
-            writeln(out, &format!(
-                "{}{:<10} {} {:.1}/{:.1} GB ({:.0}% free){}",
-                label, d.mount_point, disk_bar, used_gb, d.total_gb, d.percent_free, warning
-            ))?;
+            writeln(
+                out,
+                &format!(
+                    "{}{:<10} {} {:.1}/{:.1} GB ({:.0}% free){}",
+                    label, d.mount_point, disk_bar, used_gb, d.total_gb, d.percent_free, warning
+                ),
+            )?;
         }
     }
 
     writeln(out, &format!("IO     Busy: {:.1} MB/s", data.disk_busy_pct))?;
 
     let f = &data.fd_info;
-    let fd_pct = if f.system_max > 0 { (f.system_used as f64 / f.system_max as f64) * 100.0 } else { 0.0 };
+    let fd_pct = if f.system_max > 0 {
+        (f.system_used as f64 / f.system_max as f64) * 100.0
+    } else {
+        0.0
+    };
     let fd_color = if fd_pct > 80.0 {
         "\x1b[31m"
     } else if fd_pct > 60.0 {
@@ -180,26 +209,38 @@ fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
         ""
     };
 
-    let top_fd = f.top_processes.iter()
+    let top_fd = f
+        .top_processes
+        .iter()
         .take(3)
         .map(|(name, count)| format!("{}({})", name, count))
         .collect::<Vec<_>>()
         .join(" ");
 
-    writeln(out, &format!(
-        "FD     {}{} / {} ({:.0}%)\x1b[0m  │ top: {}",
-        fd_color, format_number(f.system_used), format_number(f.system_max), fd_pct, top_fd
-    ))?;
+    writeln(
+        out,
+        &format!(
+            "FD     {}{} / {} ({:.0}%)\x1b[0m  │ top: {}",
+            fd_color,
+            format_number(f.system_used),
+            format_number(f.system_max),
+            fd_pct,
+            top_fd
+        ),
+    )?;
 
     let s = &data.socket_overview;
     let time_wait_color = if s.time_wait > 100 { "\x1b[33m" } else { "" };
     let close_wait_color = if s.close_wait > 10 { "\x1b[31m" } else { "" };
 
-    writeln(out, &format!(
+    writeln(
+        out,
+        &format!(
         "SOCK   EST: {}  LISTEN: {}  {}TIME_WAIT: {}\x1b[0m  {}CLOSE_WAIT: {}\x1b[0m  FIN_WAIT: {}",
         s.established, s.listen, time_wait_color, s.time_wait,
         close_wait_color, s.close_wait, s.fin_wait
-    ))?;
+    ),
+    )?;
 
     let n = &data.network;
     if n.interfaces.is_empty() {
@@ -207,16 +248,23 @@ fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
     } else {
         for (idx, iface) in n.interfaces.iter().enumerate() {
             let label = if idx == 0 { "NET    " } else { "       " };
-            writeln(out, &format!(
-                "{}{:<10} ↓ {}  ↑ {}",
-                label, iface.name,
-                format_bytes_rate(iface.rx_rate),
-                format_bytes_rate(iface.tx_rate)
-            ))?;
+            writeln(
+                out,
+                &format!(
+                    "{}{:<10} ↓ {}  ↑ {}",
+                    label,
+                    iface.name,
+                    format_bytes_rate(iface.rx_rate),
+                    format_bytes_rate(iface.tx_rate)
+                ),
+            )?;
         }
     }
 
-    writeln(out, "────────────────────────────────────────────────────────────────────────────────")?;
+    writeln(
+        out,
+        "────────────────────────────────────────────────────────────────────────────────",
+    )?;
 
     Ok(())
 }
@@ -264,8 +312,10 @@ fn render_processes(
         let net_rx_fmt = format_bytes_rate(g.net_rx_bytes);
         let net_tx_fmt = format_bytes_rate(g.net_tx_bytes);
 
-        let line = format!("  {:<18} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
-            pid_label, g.cpu, mem_mb, read_fmt, write_fmt, net_rx_fmt, net_tx_fmt, g.name);
+        let line = format!(
+            "  {:<18} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
+            pid_label, g.cpu, mem_mb, read_fmt, write_fmt, net_rx_fmt, net_tx_fmt, g.name
+        );
 
         write_selectable(out, &line, *current_row == ui_state.selected_index)?;
         rows.push((g.pid, RowKind::ProcessParent));
@@ -278,9 +328,17 @@ fn render_processes(
                 let child_net_rx = format_bytes_rate(child.net_rx_bytes);
                 let child_net_tx = format_bytes_rate(child.net_tx_bytes);
 
-                let child_line = format!("    {:<16} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
-                    child.pid, child.cpu, child.mem as f64 / 1_048_576.0,
-                    child_read, child_write, child_net_rx, child_net_tx, child.name);
+                let child_line = format!(
+                    "    {:<16} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
+                    child.pid,
+                    child.cpu,
+                    child.mem as f64 / 1_048_576.0,
+                    child_read,
+                    child_write,
+                    child_net_rx,
+                    child_net_tx,
+                    child.name
+                );
 
                 write_selectable(out, &child_line, *current_row == ui_state.selected_index)?;
                 rows.push((child.pid, RowKind::ProcessChild));
@@ -293,24 +351,37 @@ fn render_processes(
 
 fn render_network(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
     let n = &data.network;
-    writeln(out, &format!("  Connections:  ESTABLISHED: {}  TIME_WAIT: {}  CLOSE_WAIT: {}",
-        n.established, n.time_wait, n.close_wait))?;
+    writeln(
+        out,
+        &format!(
+            "  Connections:  ESTABLISHED: {}  TIME_WAIT: {}  CLOSE_WAIT: {}",
+            n.established, n.time_wait, n.close_wait
+        ),
+    )?;
 
     if n.interfaces.is_empty() {
         writeln(out, "  Bandwidth: No active traffic")?;
     } else {
         for iface in &n.interfaces {
-            writeln(out, &format!("  {:<10}  ↓ {}  ↑ {}",
-                iface.name,
-                format_bytes_rate(iface.rx_rate),
-                format_bytes_rate(iface.tx_rate)))?;
+            writeln(
+                out,
+                &format!(
+                    "  {:<10}  ↓ {}  ↑ {}",
+                    iface.name,
+                    format_bytes_rate(iface.rx_rate),
+                    format_bytes_rate(iface.tx_rate)
+                ),
+            )?;
         }
     }
 
     if !n.top_bandwidth_processes.is_empty() {
         writeln(out, "  Top processes by network connections:")?;
         for p in &n.top_bandwidth_processes {
-            writeln(out, &format!("    {:<25} {} connections", p.name, p.bandwidth))?;
+            writeln(
+                out,
+                &format!("    {:<25} {} connections", p.name, p.bandwidth),
+            )?;
         }
     }
     Ok(())
@@ -318,10 +389,26 @@ fn render_network(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
 
 fn render_fd_info(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
     let f = &data.fd_info;
-    let pct = if f.system_max > 0 { (f.system_used as f64 / f.system_max as f64) * 100.0 } else { 0.0 };
-    let color = if pct > 80.0 { Color::Red } else if pct > 50.0 { Color::Yellow } else { Color::Green };
+    let pct = if f.system_max > 0 {
+        (f.system_used as f64 / f.system_max as f64) * 100.0
+    } else {
+        0.0
+    };
+    let color = if pct > 80.0 {
+        Color::Red
+    } else if pct > 50.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
     queue!(io::stdout(), SetForegroundColor(color))?;
-    writeln(out, &format!("  System: {} / {} ({:.1}%)", f.system_used, f.system_max, pct))?;
+    writeln(
+        out,
+        &format!(
+            "  System: {} / {} ({:.1}%)",
+            f.system_used, f.system_max, pct
+        ),
+    )?;
     queue!(io::stdout(), ResetColor)?;
     if !f.top_processes.is_empty() {
         writeln(out, "  Top processes by open files:")?;
@@ -334,19 +421,34 @@ fn render_fd_info(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
 
 fn render_socket_overview(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
     let s = &data.socket_overview;
-    writeln(out, &format!(
-        "  ESTABLISHED: {}  LISTEN: {}  TIME_WAIT: {}  CLOSE_WAIT: {}  FIN_WAIT: {}",
-        s.established, s.listen, s.time_wait, s.close_wait, s.fin_wait
-    ))?;
+    writeln(
+        out,
+        &format!(
+            "  ESTABLISHED: {}  LISTEN: {}  TIME_WAIT: {}  CLOSE_WAIT: {}  FIN_WAIT: {}",
+            s.established, s.listen, s.time_wait, s.close_wait, s.fin_wait
+        ),
+    )?;
 
     if s.close_wait > 10 {
         queue!(io::stdout(), SetForegroundColor(Color::Red))?;
-        writeln(out, &format!("  ⚠ High CLOSE_WAIT count ({}) — possible connection leak", s.close_wait))?;
+        writeln(
+            out,
+            &format!(
+                "  ⚠ High CLOSE_WAIT count ({}) — possible connection leak",
+                s.close_wait
+            ),
+        )?;
         queue!(io::stdout(), ResetColor)?;
     }
     if s.time_wait > 100 {
         queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
-        writeln(out, &format!("  ⚠ High TIME_WAIT count ({}) — high connection churn", s.time_wait))?;
+        writeln(
+            out,
+            &format!(
+                "  ⚠ High TIME_WAIT count ({}) — high connection churn",
+                s.time_wait
+            ),
+        )?;
         queue!(io::stdout(), ResetColor)?;
     }
 

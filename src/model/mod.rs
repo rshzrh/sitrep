@@ -1,7 +1,9 @@
 // Re-export all model types from submodules for backward compatibility.
 
 pub use app::AppView;
-pub use docker::{ContainerUIState, DockerContainerInfo, LogViewState};
+pub use docker::{
+    ContainerUIState, DockerContainerInfo, LogViewState, MultiLogLine, MultiLogViewState,
+};
 pub use swarm::{
     ServiceLogState, SwarmClusterInfo, SwarmMode, SwarmNodeInfo, SwarmServiceInfo,
     SwarmStackInfo, SwarmTaskInfo, SwarmUIState, SwarmViewLevel,

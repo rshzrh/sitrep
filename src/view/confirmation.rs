@@ -1,5 +1,10 @@
-use std::io::{self, Write, stdout};
-use crossterm::{cursor::MoveTo, queue, style::{Color, SetBackgroundColor, SetForegroundColor, SetAttribute, Attribute, ResetColor}, terminal};
+use crossterm::{
+    cursor::MoveTo,
+    queue,
+    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    terminal,
+};
+use std::io::{self, stdout, Write};
 
 pub fn render_confirmation(prompt: &str) -> io::Result<()> {
     let mut out = stdout();
@@ -9,7 +14,12 @@ pub fn render_confirmation(prompt: &str) -> io::Result<()> {
 
     // Clear the confirmation area
     queue!(out, MoveTo(0, y))?;
-    queue!(out, SetBackgroundColor(Color::DarkRed), SetForegroundColor(Color::White), SetAttribute(Attribute::Bold))?;
+    queue!(
+        out,
+        SetBackgroundColor(Color::DarkRed),
+        SetForegroundColor(Color::White),
+        SetAttribute(Attribute::Bold)
+    )?;
     let line = format!("  {} (y to confirm, any other key to cancel)  ", prompt);
     write!(out, "{:<width$}", line, width = width)?;
     queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;

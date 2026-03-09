@@ -5,7 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::model::{AppView, SortColumn, SwarmViewLevel};
 use crate::view::RowKind;
 
-use super::state::{PendingAction, PendingActionKind, resolve_swarm_overview_item};
+use super::state::{resolve_swarm_overview_item, PendingAction, PendingActionKind};
 use super::App;
 
 /// Result of handling a key: Quit the app, or key was consumed (needs render).
@@ -18,7 +18,9 @@ pub enum InputResult {
 /// Handle a key event. Returns Some(Quit) to exit, Some(Consumed) if key was handled and
 /// a render is needed, None if the key was not handled.
 pub fn handle_key(app: &mut App, key_event: KeyEvent) -> Option<InputResult> {
-    let KeyEvent { code, modifiers, .. } = key_event;
+    let KeyEvent {
+        code, modifiers, ..
+    } = key_event;
 
     if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
         return Some(InputResult::Quit);
@@ -54,6 +56,7 @@ pub fn handle_key(app: &mut App, key_event: KeyEvent) -> Option<InputResult> {
         AppView::System => handle_system(app, code, next_tab, prev_tab),
         AppView::Containers => handle_containers(app, code, next_tab, prev_tab),
         AppView::ContainerLogs(_) => handle_container_logs(app, code),
+        AppView::ContainerLogsMulti(_) => handle_container_logs_multi(app, code),
         AppView::Swarm => handle_swarm(app, code, next_tab, prev_tab),
         AppView::SwarmServiceTasks(_, _) => handle_swarm_tasks(app, code),
         AppView::SwarmServiceLogs(_, _) => handle_service_logs(app, code),
@@ -79,7 +82,7 @@ fn next_tab(app: &App) -> AppView {
                 AppView::System
             }
         }
-        AppView::Containers | AppView::ContainerLogs(_) => {
+        AppView::Containers | AppView::ContainerLogs(_) | AppView::ContainerLogsMulti(_) => {
             if app.swarm_monitor.is_swarm() {
                 AppView::Swarm
             } else {
@@ -103,7 +106,9 @@ fn prev_tab(app: &App) -> AppView {
                 AppView::System
             }
         }
-        AppView::Containers | AppView::ContainerLogs(_) => AppView::System,
+        AppView::Containers | AppView::ContainerLogs(_) | AppView::ContainerLogsMulti(_) => {
+            AppView::System
+        }
         AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
             if app.docker_monitor.is_available() {
                 AppView::Containers
@@ -179,7 +184,10 @@ fn handle_system(
                         while idx > 0 {
                             idx -= 1;
                             if app.row_mapping[idx].1 == RowKind::ProcessParent {
-                                app.monitor.ui_state.expanded_pids.remove(&app.row_mapping[idx].0);
+                                app.monitor
+                                    .ui_state
+                                    .expanded_pids
+                                    .remove(&app.row_mapping[idx].0);
                                 app.monitor.ui_state.selected_index = idx;
                                 return Some(InputResult::Consumed);
                             }
@@ -244,7 +252,8 @@ fn handle_containers(
             }
         }
         KeyCode::Down => {
-            if app.docker_monitor.ui_state.selected_index + 1 < app.docker_monitor.containers.len() {
+            if app.docker_monitor.ui_state.selected_index + 1 < app.docker_monitor.containers.len()
+            {
                 app.docker_monitor.ui_state.selected_index += 1;
                 app.docker_monitor.status_message = None;
                 return Some(InputResult::Consumed);
@@ -265,6 +274,41 @@ fn handle_containers(
                     app.docker_monitor.ui_state.expanded_ids.insert(c.id);
                 }
                 return Some(InputResult::Consumed);
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(c) = app.docker_monitor.selected_container().cloned() {
+                if app
+                    .docker_monitor
+                    .ui_state
+                    .selected_containers
+                    .contains(&c.id)
+                {
+                    app.docker_monitor
+                        .ui_state
+                        .selected_containers
+                        .remove(&c.id);
+                } else {
+                    app.docker_monitor.ui_state.selected_containers.insert(c.id);
+                }
+                return Some(InputResult::Consumed);
+            }
+        }
+        KeyCode::Char('l') | KeyCode::Char('L') => {
+            let selected = app.docker_monitor.ui_state.selected_containers.clone();
+            if !selected.is_empty() {
+                let container_data: Vec<(String, String)> = app
+                    .docker_monitor
+                    .containers
+                    .iter()
+                    .filter(|c| selected.contains(&c.id))
+                    .map(|c| (c.id.clone(), c.name.clone()))
+                    .collect();
+                if !container_data.is_empty() {
+                    app.docker_monitor.start_log_stream_multi(&container_data);
+                    app.app_view = AppView::ContainerLogsMulti(container_data);
+                    return Some(InputResult::Consumed);
+                }
             }
         }
         KeyCode::Char('S') => {
@@ -308,30 +352,174 @@ fn handle_container_logs(app: &mut App, code: KeyCode) -> Option<InputResult> {
         .unwrap_or(24)
         .saturating_sub(4);
 
-    if app.docker_monitor.log_state.as_ref().map_or(false, |s| s.search_mode) {
+    if let AppView::ContainerLogs(container_id) = &app.app_view {
+        let log_state = app.docker_monitor.get_log_state_mut(container_id);
+        if let Some(ref log_state) = log_state {
+            if log_state.search_mode {
+                return match code {
+                    KeyCode::Enter => {
+                        if let Some(ref mut ls) = app.docker_monitor.get_log_state_mut(container_id)
+                        {
+                            ls.search_mode = false;
+                        }
+                        Some(InputResult::Consumed)
+                    }
+                    KeyCode::Esc => {
+                        if let Some(ref mut ls) = app.docker_monitor.get_log_state_mut(container_id)
+                        {
+                            ls.search_mode = false;
+                            ls.search_query.clear();
+                        }
+                        Some(InputResult::Consumed)
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(ref mut ls) = app.docker_monitor.get_log_state_mut(container_id)
+                        {
+                            ls.search_query.pop();
+                        }
+                        Some(InputResult::Consumed)
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(ref mut ls) = app.docker_monitor.get_log_state_mut(container_id)
+                        {
+                            ls.search_query.push(c);
+                        }
+                        Some(InputResult::Consumed)
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => {
+            // Single-container logs: stop the active stream on exit.
+            app.docker_monitor.stop_log_stream();
+            app.app_view = AppView::Containers;
+            Some(InputResult::Consumed)
+        }
+        KeyCode::Up => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    log_state.auto_follow = false;
+                    let max_offset = log_state.lines.len().saturating_sub(1);
+                    if log_state.scroll_offset < max_offset {
+                        log_state.scroll_offset += 1;
+                    }
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        KeyCode::Down => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    if log_state.scroll_offset > 0 {
+                        log_state.scroll_offset -= 1;
+                        if log_state.scroll_offset == 0 {
+                            log_state.auto_follow = true;
+                        }
+                    }
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        KeyCode::Char('f') | KeyCode::End => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    log_state.auto_follow = true;
+                    log_state.scroll_offset = 0;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        KeyCode::Char('/') => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    log_state.search_mode = true;
+                    log_state.search_query.clear();
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        KeyCode::Char('n') => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    log_state.search_query.clear();
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        KeyCode::PageUp => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    log_state.auto_follow = false;
+                    let max_offset = log_state.lines.len().saturating_sub(1);
+                    log_state.scroll_offset = (log_state.scroll_offset + page_size).min(max_offset);
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        KeyCode::PageDown => {
+            if let AppView::ContainerLogs(container_id) = &app.app_view.clone() {
+                if let Some(ref mut log_state) = app.docker_monitor.get_log_state_mut(&container_id)
+                {
+                    if log_state.scroll_offset > page_size {
+                        log_state.scroll_offset -= page_size;
+                    } else {
+                        log_state.scroll_offset = 0;
+                        log_state.auto_follow = true;
+                    }
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_container_logs_multi(app: &mut App, code: KeyCode) -> Option<InputResult> {
+    let page_size = crossterm::terminal::size()
+        .map(|(_, h)| h as usize)
+        .unwrap_or(24)
+        .saturating_sub(4);
+
+    if app
+        .docker_monitor
+        .multi_log_state
+        .as_ref()
+        .map(|s| s.search_mode)
+        .unwrap_or(false)
+    {
         return match code {
             KeyCode::Enter => {
-                if let Some(ref mut log_state) = app.docker_monitor.log_state {
-                    log_state.search_mode = false;
+                if let Some(ref mut ls) = app.docker_monitor.multi_log_state {
+                    ls.search_mode = false;
                 }
                 Some(InputResult::Consumed)
             }
             KeyCode::Esc => {
-                if let Some(ref mut log_state) = app.docker_monitor.log_state {
-                    log_state.search_mode = false;
-                    log_state.search_query.clear();
+                if let Some(ref mut ls) = app.docker_monitor.multi_log_state {
+                    ls.search_mode = false;
+                    ls.search_query.clear();
                 }
                 Some(InputResult::Consumed)
             }
             KeyCode::Backspace => {
-                if let Some(ref mut log_state) = app.docker_monitor.log_state {
-                    log_state.search_query.pop();
+                if let Some(ref mut ls) = app.docker_monitor.multi_log_state {
+                    ls.search_query.pop();
                 }
                 Some(InputResult::Consumed)
             }
             KeyCode::Char(c) => {
-                if let Some(ref mut log_state) = app.docker_monitor.log_state {
-                    log_state.search_query.push(c);
+                if let Some(ref mut ls) = app.docker_monitor.multi_log_state {
+                    ls.search_query.push(c);
                 }
                 Some(InputResult::Consumed)
             }
@@ -341,12 +529,12 @@ fn handle_container_logs(app: &mut App, code: KeyCode) -> Option<InputResult> {
 
     match code {
         KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left => {
-            app.docker_monitor.stop_log_stream();
+            // Multi-container logs: preserve existing streams when exiting the view.
             app.app_view = AppView::Containers;
             Some(InputResult::Consumed)
         }
         KeyCode::Up => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 log_state.auto_follow = false;
                 let max_offset = log_state.lines.len().saturating_sub(1);
                 if log_state.scroll_offset < max_offset {
@@ -356,7 +544,7 @@ fn handle_container_logs(app: &mut App, code: KeyCode) -> Option<InputResult> {
             Some(InputResult::Consumed)
         }
         KeyCode::Down => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 if log_state.scroll_offset > 0 {
                     log_state.scroll_offset -= 1;
                     if log_state.scroll_offset == 0 {
@@ -367,27 +555,27 @@ fn handle_container_logs(app: &mut App, code: KeyCode) -> Option<InputResult> {
             Some(InputResult::Consumed)
         }
         KeyCode::Char('f') | KeyCode::End => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 log_state.auto_follow = true;
                 log_state.scroll_offset = 0;
             }
             Some(InputResult::Consumed)
         }
         KeyCode::Char('/') => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 log_state.search_mode = true;
                 log_state.search_query.clear();
             }
             Some(InputResult::Consumed)
         }
         KeyCode::Char('n') => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 log_state.search_query.clear();
             }
             Some(InputResult::Consumed)
         }
         KeyCode::PageUp => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 log_state.auto_follow = false;
                 let max_offset = log_state.lines.len().saturating_sub(1);
                 log_state.scroll_offset = (log_state.scroll_offset + page_size).min(max_offset);
@@ -395,7 +583,7 @@ fn handle_container_logs(app: &mut App, code: KeyCode) -> Option<InputResult> {
             Some(InputResult::Consumed)
         }
         KeyCode::PageDown => {
-            if let Some(ref mut log_state) = app.docker_monitor.log_state {
+            if let Some(ref mut log_state) = app.docker_monitor.multi_log_state {
                 if log_state.scroll_offset > page_size {
                     log_state.scroll_offset -= page_size;
                 } else {
@@ -450,42 +638,41 @@ fn handle_swarm(
                 None
             }
         }
-        KeyCode::Right => {
-            match item {
-                super::state::SwarmOverviewItem::NodesHeader => {
-                    app.swarm_monitor.ui_state.expanded_ids.insert("__nodes__".to_string());
-                    Some(InputResult::Consumed)
-                }
-                super::state::SwarmOverviewItem::StackHeader(name) => {
-                    app.swarm_monitor.ui_state.expanded_ids.insert(name);
-                    Some(InputResult::Consumed)
-                }
-                super::state::SwarmOverviewItem::Service(id, name) => {
-                    app.swarm_monitor.enter_task_view(&id, &name);
-                    app.app_view = AppView::SwarmServiceTasks(id, name);
-                    Some(InputResult::Consumed)
-                }
-                _ => None,
+        KeyCode::Right => match item {
+            super::state::SwarmOverviewItem::NodesHeader => {
+                app.swarm_monitor
+                    .ui_state
+                    .expanded_ids
+                    .insert("__nodes__".to_string());
+                Some(InputResult::Consumed)
             }
-        }
-        KeyCode::Left => {
-            match item {
-                super::state::SwarmOverviewItem::NodesHeader => {
-                    app.swarm_monitor.ui_state.expanded_ids.remove("__nodes__");
-                    Some(InputResult::Consumed)
-                }
-                super::state::SwarmOverviewItem::StackHeader(name) => {
-                    app.swarm_monitor.ui_state.expanded_ids.remove(&name);
-                    Some(InputResult::Consumed)
-                }
-                super::state::SwarmOverviewItem::Node => {
-                    app.swarm_monitor.ui_state.expanded_ids.remove("__nodes__");
-                    app.swarm_monitor.ui_state.selected_index = 0;
-                    Some(InputResult::Consumed)
-                }
-                _ => None,
+            super::state::SwarmOverviewItem::StackHeader(name) => {
+                app.swarm_monitor.ui_state.expanded_ids.insert(name);
+                Some(InputResult::Consumed)
             }
-        }
+            super::state::SwarmOverviewItem::Service(id, name) => {
+                app.swarm_monitor.enter_task_view(&id, &name);
+                app.app_view = AppView::SwarmServiceTasks(id, name);
+                Some(InputResult::Consumed)
+            }
+            _ => None,
+        },
+        KeyCode::Left => match item {
+            super::state::SwarmOverviewItem::NodesHeader => {
+                app.swarm_monitor.ui_state.expanded_ids.remove("__nodes__");
+                Some(InputResult::Consumed)
+            }
+            super::state::SwarmOverviewItem::StackHeader(name) => {
+                app.swarm_monitor.ui_state.expanded_ids.remove(&name);
+                Some(InputResult::Consumed)
+            }
+            super::state::SwarmOverviewItem::Node => {
+                app.swarm_monitor.ui_state.expanded_ids.remove("__nodes__");
+                app.swarm_monitor.ui_state.selected_index = 0;
+                Some(InputResult::Consumed)
+            }
+            _ => None,
+        },
         KeyCode::Char('R') => {
             if let super::state::SwarmOverviewItem::Service(id, name) = item {
                 app.pending_action = Some(PendingAction {
@@ -560,7 +747,12 @@ fn handle_service_logs(app: &mut App, code: KeyCode) -> Option<InputResult> {
         .unwrap_or(24)
         .saturating_sub(4);
 
-    if app.swarm_monitor.log_state.as_ref().map_or(false, |s| s.search_mode) {
+    if app
+        .swarm_monitor
+        .log_state
+        .as_ref()
+        .map_or(false, |s| s.search_mode)
+    {
         return match code {
             KeyCode::Enter => {
                 if let Some(ref mut log_state) = app.swarm_monitor.log_state {

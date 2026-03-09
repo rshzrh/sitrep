@@ -1,8 +1,11 @@
-use std::io::{self, Write, stdout};
-use crossterm::{cursor, queue, style::{Color, SetForegroundColor, ResetColor, SetAttribute, Attribute}};
+use crossterm::{
+    cursor, queue,
+    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
+};
+use std::io::{self, stdout, Write};
 
-use crate::model::{DockerContainerInfo, ContainerUIState};
-use super::shared::{truncate_str, writeln, write_selectable};
+use super::shared::{truncate_str, write_selectable, writeln};
+use crate::model::{ContainerUIState, DockerContainerInfo};
 
 pub fn render_containers(
     containers: &[DockerContainerInfo],
@@ -23,21 +26,31 @@ pub fn render_containers(
         writeln(&mut out, "")?;
         writeln(&mut out, "  No running containers found.")?;
         writeln(&mut out, "")?;
-        writeln(&mut out, "  Make sure Docker is running and you have containers up.")?;
+        writeln(
+            &mut out,
+            "  Make sure Docker is running and you have containers up.",
+        )?;
     } else {
         writeln(&mut out, "")?;
 
         // Column header
         queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
-        write!(out, "  {:<14} {:<20} {:<12} {:<10} {:<8} {:<26} {}",
-            "CONTAINER ID", "NAME", "STATUS", "UPTIME", "CPU %", "PORTS", "IP")?;
+        write!(
+            out,
+            "  {:<2} {:<14} {:<20} {:<12} {:<10} {:<8} {:<26} {}",
+            "", "CONTAINER ID", "NAME", "STATUS", "UPTIME", "CPU %", "PORTS", "IP"
+        )?;
         queue!(io::stdout(), SetAttribute(Attribute::Reset))?;
         write!(out, "\r\n")?;
 
         for (idx, c) in containers.iter().enumerate() {
             let selected = idx == ui_state.selected_index;
+            let is_multi_selected = ui_state.selected_containers.contains(&c.id);
+            let marker = if is_multi_selected { "[*]" } else { "[ ]" };
 
-            let line = format!("  {:<14} {:<20} {:<12} {:<10} {:<8.1} {:<26} {}",
+            let line = format!(
+                "  {:2} {:<14} {:<20} {:<12} {:<10} {:<8.1} {:<26} {}",
+                marker,
                 c.id,
                 truncate_str(&c.name, 18),
                 truncate_str(&c.state, 10),
@@ -70,7 +83,7 @@ pub fn render_containers(
     }
 
     // Footer
-    let help = "q/Esc: Back | Tab: Switch | ↑/↓: Navigate | →: Logs | S: Start | T: Stop | R: Restart (confirm with y)";
+    let help = "q/Esc: Back | Tab: Switch | ↑/↓: Navigate | →: Logs | Space: Select | l: Logs Selected | S: Start | T: Stop | R: Restart";
     let help_y = size.1.saturating_sub(1);
     queue!(
         out,

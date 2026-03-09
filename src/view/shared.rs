@@ -1,5 +1,8 @@
+use crossterm::{
+    queue,
+    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+};
 use std::io::{self, Write};
-use crossterm::{queue, style::{Color, SetForegroundColor, SetBackgroundColor, ResetColor, Attribute, SetAttribute}};
 
 /// Truncate a string to at most `max_len` characters (not bytes), appending "..."
 /// if truncated. Safe for multi-byte UTF-8.
@@ -33,7 +36,11 @@ pub fn writeln(out: &mut impl Write, text: &str) -> io::Result<()> {
 
 pub fn write_section_header(out: &mut impl Write, text: &str, selected: bool) -> io::Result<()> {
     if selected {
-        queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+        queue!(
+            io::stdout(),
+            SetBackgroundColor(Color::DarkBlue),
+            SetForegroundColor(Color::White)
+        )?;
     } else {
         queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
     }
@@ -44,7 +51,11 @@ pub fn write_section_header(out: &mut impl Write, text: &str, selected: bool) ->
 
 pub fn write_selectable(out: &mut impl Write, text: &str, selected: bool) -> io::Result<()> {
     if selected {
-        queue!(io::stdout(), SetBackgroundColor(Color::DarkGrey), SetForegroundColor(Color::White))?;
+        queue!(
+            io::stdout(),
+            SetBackgroundColor(Color::DarkGrey),
+            SetForegroundColor(Color::White)
+        )?;
     }
     write!(out, "{}\r\n", text)?;
     if selected {

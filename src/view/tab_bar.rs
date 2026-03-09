@@ -1,9 +1,9 @@
-use std::io::{self, Write};
 use crossterm::{
     cursor, queue,
-    style::{Color, SetForegroundColor, SetBackgroundColor, ResetColor},
+    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal,
 };
+use std::io::{self, Write};
 
 use crate::model::AppView;
 
@@ -21,7 +21,11 @@ pub fn render_tab_bar(
     // System tab
     let system_active = matches!(current_view, AppView::System);
     if system_active {
-        queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+        queue!(
+            io::stdout(),
+            SetBackgroundColor(Color::DarkBlue),
+            SetForegroundColor(Color::White)
+        )?;
     } else {
         queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
     }
@@ -30,9 +34,16 @@ pub fn render_tab_bar(
 
     if docker_available {
         write!(out, "  ")?;
-        let containers_active = matches!(current_view, AppView::Containers | AppView::ContainerLogs(_));
+        let containers_active = matches!(
+            current_view,
+            AppView::Containers | AppView::ContainerLogs(_)
+        );
         if containers_active {
-            queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+            queue!(
+                io::stdout(),
+                SetBackgroundColor(Color::DarkBlue),
+                SetForegroundColor(Color::White)
+            )?;
         } else {
             queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
         }
@@ -47,7 +58,11 @@ pub fn render_tab_bar(
             AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _)
         );
         if swarm_tab_active {
-            queue!(io::stdout(), SetBackgroundColor(Color::DarkBlue), SetForegroundColor(Color::White))?;
+            queue!(
+                io::stdout(),
+                SetBackgroundColor(Color::DarkBlue),
+                SetForegroundColor(Color::White)
+            )?;
         } else {
             queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
         }

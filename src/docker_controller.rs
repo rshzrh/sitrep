@@ -1,8 +1,11 @@
 use tokio::sync::mpsc;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use crate::docker::DockerClient;
-use crate::model::{DockerContainerInfo, ContainerUIState, LogViewState};
+use crate::model::{
+    ContainerUIState, DockerContainerInfo, LogViewState, MultiLogLine, MultiLogViewState,
+};
 
 /// Receiver for background Docker action results.
 type ActionReceiver = std::sync::mpsc::Receiver<Result<String, String>>;
@@ -12,8 +15,10 @@ pub struct DockerMonitor {
     client: Option<DockerClient>,
     pub containers: Vec<DockerContainerInfo>,
     pub ui_state: ContainerUIState,
-    pub log_state: Option<LogViewState>,
-    log_receiver: Option<mpsc::Receiver<String>>,
+    pub log_states: HashMap<String, LogViewState>,
+    pub multi_log_state: Option<MultiLogViewState>,
+    log_receivers: HashMap<String, mpsc::Receiver<String>>,
+    multi_log_seq: u64,
     rt: Arc<tokio::runtime::Runtime>,
     pub docker_available: bool,
     pub status_message: Option<String>,
@@ -36,8 +41,10 @@ impl DockerMonitor {
             client: if docker_available { client } else { None },
             containers: Vec::new(),
             ui_state: ContainerUIState::default(),
-            log_state: None,
-            log_receiver: None,
+            log_states: HashMap::new(),
+            multi_log_state: None,
+            log_receivers: HashMap::new(),
+            multi_log_seq: 0,
             rt,
             docker_available,
             status_message: None,
@@ -85,42 +92,123 @@ impl DockerMonitor {
 
     /// Start tailing logs for the given container.
     pub fn start_log_stream(&mut self, container_id: &str, container_name: &str) {
-        let Some(ref client) = self.client else { return };
+        // Create a fresh client for this log stream to avoid any concurrency issues
+        let Some(client) = DockerClient::try_new() else { 
+            return 
+        };
 
         let handle = self.rt.handle();
         let rx = client.tail_logs(container_id, handle);
 
-        self.log_state = Some(LogViewState::new(
+        self.log_states.insert(
             container_id.to_string(),
-            container_name.to_string(),
-        ));
-        self.log_receiver = Some(rx);
+            LogViewState::new(container_id.to_string(), container_name.to_string()),
+        );
+        self.log_receivers.insert(container_id.to_string(), rx);
+    }
+
+    /// Start tailing logs for multiple containers (preserve existing streams).
+    pub fn start_log_stream_multi(&mut self, containers: &[(String, String)]) {
+        if self.multi_log_state.is_none() {
+            self.multi_log_state = Some(MultiLogViewState::new());
+        }
+        for (container_id, container_name) in containers {
+            if self.log_states.contains_key(container_id) {
+                continue; // already streaming this container
+            }
+            self.start_log_stream(container_id, container_name);
+        }
     }
 
     /// Stop the log stream and return to container list.
     pub fn stop_log_stream(&mut self) {
-        self.log_receiver = None;
-        self.log_state = None;
+        self.log_receivers.clear();
+        self.log_states.clear();
+        self.multi_log_state = None;
+        self.multi_log_seq = 0;
+    }
+
+    // Note: per-container stream teardown is handled implicitly when receivers
+    // disconnect; we no longer expose a separate public API for stopping one.
+
+    /// Get a single log state by container ID.
+    pub fn get_log_state(&self, container_id: &str) -> Option<&LogViewState> {
+        self.log_states.get(container_id)
+    }
+
+    /// Get a mutable single log state by container ID.
+    pub fn get_log_state_mut(&mut self, container_id: &str) -> Option<&mut LogViewState> {
+        self.log_states.get_mut(container_id)
     }
 
     /// Drain any pending log lines from the channel into LogViewState.
     /// Should be called frequently (~100ms) when in log view.
     pub fn poll_logs(&mut self) {
-        let Some(ref mut rx) = self.log_receiver else { return };
-        let Some(ref mut log_state) = self.log_state else { return };
+        let container_ids: Vec<String> = self.log_receivers.keys().cloned().collect();
+        let mut disconnected_ids: Vec<String> = Vec::new();
 
-        // Drain up to 100 lines per poll to avoid blocking
+        // Fair round-robin fan-in: at most one line per container each round.
+        // This prevents one noisy stream from dominating the visible tail.
         for _ in 0..100 {
-            match rx.try_recv() {
-                Ok(line) => {
-                    log_state.push_line(line);
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    log_state.push_line("[log stream ended]".to_string());
-                    break;
+            let mut made_progress = false;
+
+            for container_id in &container_ids {
+                let maybe_line = if let Some(ref mut rx) = self.log_receivers.get_mut(container_id) {
+                    match rx.try_recv() {
+                        Ok(line) => Some(Ok(line)),
+                        Err(mpsc::error::TryRecvError::Empty) => None,
+                        Err(mpsc::error::TryRecvError::Disconnected) => Some(Err(())),
+                    }
+                } else {
+                    None
+                };
+
+                match maybe_line {
+                    Some(Ok(line)) => {
+                        made_progress = true;
+                        if let Some(ref mut log_state) = self.log_states.get_mut(container_id) {
+                            let container_name = log_state.container_name.clone();
+                            log_state.push_line(line.clone());
+                            if let Some(ref mut multi) = self.multi_log_state {
+                                self.multi_log_seq += 1;
+                                multi.push_line(MultiLogLine {
+                                    container_id: container_id.clone(),
+                                    container_name,
+                                    line,
+                                    seq: self.multi_log_seq,
+                                });
+                            }
+                        }
+                    }
+                    Some(Err(())) => {
+                        disconnected_ids.push(container_id.clone());
+                        if let Some(ref mut log_state) = self.log_states.get_mut(container_id) {
+                            let container_name = log_state.container_name.clone();
+                            let stream_ended = "[log stream ended]".to_string();
+                            log_state.push_line(stream_ended.clone());
+                            if let Some(ref mut multi) = self.multi_log_state {
+                                self.multi_log_seq += 1;
+                                multi.push_line(MultiLogLine {
+                                    container_id: container_id.clone(),
+                                    container_name,
+                                    line: stream_ended,
+                                    seq: self.multi_log_seq,
+                                });
+                            }
+                        }
+                    }
+                    None => {}
                 }
             }
+
+            if !made_progress {
+                break;
+            }
+        }
+
+        // Drop disconnected receivers so we don't emit repeated "ended" lines.
+        for id in disconnected_ids {
+            self.log_receivers.remove(&id);
         }
     }
 

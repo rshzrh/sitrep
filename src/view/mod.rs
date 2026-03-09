@@ -1,17 +1,21 @@
-mod shared;
-mod tab_bar;
-mod system;
-mod containers;
-mod swarm;
-mod logs;
 mod confirmation;
+mod containers;
+mod logs;
+mod shared;
+mod swarm;
+mod system;
+mod tab_bar;
 
-use std::io::{self, Write};
-use crossterm::{execute, cursor, queue, style::{Color, SetForegroundColor, ResetColor}, terminal};
 use crate::layout::SectionId;
+use crossterm::{
+    cursor, execute, queue,
+    style::{Color, ResetColor, SetForegroundColor},
+    terminal,
+};
+use std::io::{self, Write};
 use sysinfo::Pid;
 
-pub use shared::{truncate_str, safe_truncate};
+pub use shared::{safe_truncate, truncate_str};
 
 /// What kind of row this is in the row mapping
 #[derive(Clone, Copy, PartialEq)]
@@ -34,7 +38,11 @@ impl Presenter {
         let (cols, rows) = terminal::size()?;
         if cols < MIN_COLS || rows < MIN_ROWS {
             let mut out = std::io::stdout();
-            execute!(out, terminal::Clear(terminal::ClearType::All), cursor::MoveTo(0, 0))?;
+            execute!(
+                out,
+                terminal::Clear(terminal::ClearType::All),
+                cursor::MoveTo(0, 0)
+            )?;
             let msg = format!(
                 "Terminal too small ({}x{}). Resize to at least {}x{}.",
                 cols, rows, MIN_COLS, MIN_ROWS
@@ -59,7 +67,15 @@ impl Presenter {
         node_count: u32,
         time: &str,
     ) -> io::Result<()> {
-        tab_bar::render_tab_bar(out, current_view, docker_available, container_count, swarm_active, node_count, time)
+        tab_bar::render_tab_bar(
+            out,
+            current_view,
+            docker_available,
+            container_count,
+            swarm_active,
+            node_count,
+            time,
+        )
     }
 
     pub fn render(
@@ -82,6 +98,13 @@ impl Presenter {
         logs::render_logs(log_state)
     }
 
+    pub fn render_multi_container_logs(
+        log_state: &crate::model::MultiLogViewState,
+        active_container_names: &[String],
+    ) -> io::Result<()> {
+        logs::render_multi_container_logs(log_state, active_container_names)
+    }
+
     pub fn render_swarm_overview(
         cluster_info: &Option<crate::model::SwarmClusterInfo>,
         nodes: &[crate::model::SwarmNodeInfo],
@@ -92,7 +115,16 @@ impl Presenter {
         status_message: &Option<String>,
         service_tasks: &std::collections::HashMap<String, Vec<crate::model::SwarmTaskInfo>>,
     ) -> io::Result<()> {
-        swarm::render_swarm_overview(cluster_info, nodes, stacks, services, ui_state, warnings, status_message, service_tasks)
+        swarm::render_swarm_overview(
+            cluster_info,
+            nodes,
+            stacks,
+            services,
+            ui_state,
+            warnings,
+            status_message,
+            service_tasks,
+        )
     }
 
     pub fn render_swarm_tasks(

@@ -1,20 +1,27 @@
 use std::io;
 
-use crossterm::{execute, cursor::MoveTo, terminal::Clear, terminal::ClearType};
+use crossterm::{cursor::MoveTo, execute, terminal::Clear, terminal::ClearType};
 
-use crate::model::SwarmViewLevel;
+use crate::model::{AppView, SwarmViewLevel};
 use crate::view::Presenter;
 
 use super::App;
 
 pub fn render(app: &mut App) -> io::Result<()> {
-    let time_str = app.monitor.last_data.as_ref()
+    let time_str = app
+        .monitor
+        .last_data
+        .as_ref()
         .map(|d| d.time.clone())
         .unwrap_or_else(|| "...".to_string());
 
     let swarm_active = app.swarm_monitor.is_swarm();
-    let swarm_node_count = app.swarm_monitor.cluster_info.as_ref()
-        .map(|c| c.nodes_total).unwrap_or(0);
+    let swarm_node_count = app
+        .swarm_monitor
+        .cluster_info
+        .as_ref()
+        .map(|c| c.nodes_total)
+        .unwrap_or(0);
 
     let mut out = io::stdout();
 
@@ -31,11 +38,8 @@ pub fn render(app: &mut App) -> io::Result<()> {
                 &time_str,
             )?;
             if let Some(ref data) = app.monitor.last_data {
-                app.row_mapping = Presenter::render(
-                    data,
-                    &mut app.monitor.ui_state,
-                    &app.monitor.layout,
-                )?;
+                app.row_mapping =
+                    Presenter::render(data, &mut app.monitor.ui_state, &app.monitor.layout)?;
             }
         }
         crate::model::AppView::Containers => {
@@ -56,8 +60,26 @@ pub fn render(app: &mut App) -> io::Result<()> {
             )?;
         }
         crate::model::AppView::ContainerLogs(_) => {
-            if let Some(ref log_state) = app.docker_monitor.log_state {
-                Presenter::render_logs(log_state)?;
+            if let AppView::ContainerLogs(container_id) = &app.app_view {
+                if let Some(ref log_state) = app.docker_monitor.get_log_state(container_id) {
+                    Presenter::render_logs(log_state)?;
+                }
+            }
+        }
+        crate::model::AppView::ContainerLogsMulti(_) => {
+            // Build the indicator list from actually active log streams,
+            // not just the names captured when entering the view.
+            let mut active_names: Vec<String> = app
+                .docker_monitor
+                .log_states
+                .values()
+                .map(|s| s.container_name.clone())
+                .collect();
+            active_names.sort();
+            active_names.dedup();
+
+            if let Some(ref multi_state) = app.docker_monitor.multi_log_state {
+                Presenter::render_multi_container_logs(multi_state, &active_names)?;
             }
         }
         crate::model::AppView::Swarm | crate::model::AppView::SwarmServiceTasks(_, _) => {
