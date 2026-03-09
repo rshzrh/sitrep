@@ -1,6 +1,14 @@
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+
+struct ServiceLogFilterCache {
+    line_version: u64,
+    query: String,
+    filter_errors: bool,
+    matches: Vec<usize>,
+}
 
 /// Whether we're running standalone Docker or in a Swarm cluster
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +145,8 @@ pub struct ServiceLogState {
     pub filter_errors: bool,
     pub search_mode: bool,
     pub search_query: String,
+    line_version: u64,
+    filter_cache: RefCell<Option<ServiceLogFilterCache>>,
 }
 
 impl ServiceLogState {
@@ -150,6 +160,8 @@ impl ServiceLogState {
             filter_errors: false,
             search_mode: false,
             search_query: String::new(),
+            line_version: 0,
+            filter_cache: RefCell::new(None),
         }
     }
 
@@ -158,7 +170,58 @@ impl ServiceLogState {
             self.lines.pop_front();
         }
         self.lines.push_back(line);
+        self.line_version += 1;
+        *self.filter_cache.borrow_mut() = None;
     }
+
+    pub fn with_filtered_indices<R>(&self, f: impl FnOnce(&[usize]) -> R) -> R {
+        let query = self.search_query.to_lowercase();
+        let filter_errors = self.filter_errors;
+        let mut cache = self.filter_cache.borrow_mut();
+        let cache_miss = cache
+            .as_ref()
+            .map(|cached| {
+                cached.line_version != self.line_version
+                    || cached.query != query
+                    || cached.filter_errors != filter_errors
+            })
+            .unwrap_or(true);
+
+        if cache_miss {
+            let matches = self
+                .lines
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    if filter_errors && !is_error_like(line) {
+                        return None;
+                    }
+                    if !query.is_empty() && !line.to_lowercase().contains(&query) {
+                        return None;
+                    }
+                    Some(idx)
+                })
+                .collect();
+            *cache = Some(ServiceLogFilterCache {
+                line_version: self.line_version,
+                query,
+                filter_errors,
+                matches,
+            });
+        }
+
+        f(&cache.as_ref().expect("service log filter cache populated").matches)
+    }
+}
+
+fn is_error_like(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("error")
+        || lower.contains("err")
+        || lower.contains("panic")
+        || lower.contains("fatal")
+        || lower.contains("exception")
+        || lower.contains("fail")
 }
 
 #[cfg(test)]

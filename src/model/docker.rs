@@ -1,5 +1,18 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+
+struct LogSearchCache {
+    line_version: u64,
+    query: String,
+    matches: Vec<usize>,
+}
+
+struct MultiLogSearchCache {
+    line_version: u64,
+    query: String,
+    matches: Vec<usize>,
+}
 
 #[derive(Clone, Debug)]
 pub struct DockerContainerInfo {
@@ -24,6 +37,8 @@ pub struct LogViewState {
     pub auto_follow: bool,
     pub search_mode: bool,    // true when typing a search query
     pub search_query: String, // current search text
+    line_version: u64,
+    search_cache: RefCell<Option<LogSearchCache>>,
 }
 
 impl LogViewState {
@@ -36,6 +51,8 @@ impl LogViewState {
             auto_follow: true,
             search_mode: false,
             search_query: String::new(),
+            line_version: 0,
+            search_cache: RefCell::new(None),
         }
     }
 
@@ -44,6 +61,36 @@ impl LogViewState {
             self.lines.pop_front();
         }
         self.lines.push_back(line);
+        self.line_version += 1;
+        *self.search_cache.borrow_mut() = None;
+    }
+
+    pub fn with_filtered_indices<R>(&self, f: impl FnOnce(&[usize]) -> R) -> R {
+        let query = self.search_query.to_lowercase();
+        let mut cache = self.search_cache.borrow_mut();
+        let cache_miss = cache
+            .as_ref()
+            .map(|cached| cached.line_version != self.line_version || cached.query != query)
+            .unwrap_or(true);
+
+        if cache_miss {
+            let matches = if query.is_empty() {
+                (0..self.lines.len()).collect()
+            } else {
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, line)| line.to_lowercase().contains(&query).then_some(idx))
+                    .collect()
+            };
+            *cache = Some(LogSearchCache {
+                line_version: self.line_version,
+                query,
+                matches,
+            });
+        }
+
+        f(&cache.as_ref().expect("search cache populated").matches)
     }
 }
 
@@ -61,6 +108,8 @@ pub struct MultiLogViewState {
     pub auto_follow: bool,
     pub search_mode: bool,
     pub search_query: String,
+    line_version: u64,
+    search_cache: RefCell<Option<MultiLogSearchCache>>,
 }
 
 impl MultiLogViewState {
@@ -71,6 +120,8 @@ impl MultiLogViewState {
             auto_follow: true,
             search_mode: false,
             search_query: String::new(),
+            line_version: 0,
+            search_cache: RefCell::new(None),
         }
     }
 
@@ -79,6 +130,38 @@ impl MultiLogViewState {
             self.lines.pop_front();
         }
         self.lines.push_back(line);
+        self.line_version += 1;
+        *self.search_cache.borrow_mut() = None;
+    }
+
+    pub fn with_filtered_indices<R>(&self, f: impl FnOnce(&[usize]) -> R) -> R {
+        let query = self.search_query.to_lowercase();
+        let mut cache = self.search_cache.borrow_mut();
+        let cache_miss = cache
+            .as_ref()
+            .map(|cached| cached.line_version != self.line_version || cached.query != query)
+            .unwrap_or(true);
+
+        if cache_miss {
+            let matches = if query.is_empty() {
+                (0..self.lines.len()).collect()
+            } else {
+                self.lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, entry)| {
+                        entry.line.to_lowercase().contains(&query).then_some(idx)
+                    })
+                    .collect()
+            };
+            *cache = Some(MultiLogSearchCache {
+                line_version: self.line_version,
+                query,
+                matches,
+            });
+        }
+
+        f(&cache.as_ref().expect("multi-log search cache populated").matches)
     }
 }
 
