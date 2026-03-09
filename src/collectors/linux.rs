@@ -1,6 +1,7 @@
 use super::SystemCollector;
 use crate::model::{ContextSwitchInfo, FdInfo, SocketOverviewInfo};
 use sysinfo::Pid;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -19,6 +20,14 @@ pub struct LinuxCollector {
     /// Grows over time so the returned values behave like macOS `nettop`
     /// (which reports lifetime bytes per process).
     cumulative_net: HashMap<u32, (u64, u64)>,
+
+    socket_scan_cache: RefCell<Option<SocketScanCache>>,
+}
+
+struct SocketScanCache {
+    scanned_at: Instant,
+    socket_pid_map: HashMap<u64, (u32, String)>,
+    tcp_entries: Vec<(u64, u8)>,
 }
 
 impl LinuxCollector {
@@ -29,6 +38,7 @@ impl LinuxCollector {
             prev_net_bytes: HashMap::new(),
             prev_net_time: None,
             cumulative_net: HashMap::new(),
+            socket_scan_cache: RefCell::new(None),
         }
     }
 
@@ -157,6 +167,28 @@ impl LinuxCollector {
             }
         }
         entries
+    }
+
+    fn socket_scan_ttl() -> std::time::Duration {
+        std::time::Duration::from_secs(1)
+    }
+
+    fn get_socket_scan(&self) -> (HashMap<u64, (u32, String)>, Vec<(u64, u8)>) {
+        let now = Instant::now();
+        if let Some(cache) = self.socket_scan_cache.borrow().as_ref() {
+            if now.duration_since(cache.scanned_at) < Self::socket_scan_ttl() {
+                return (cache.socket_pid_map.clone(), cache.tcp_entries.clone());
+            }
+        }
+
+        let socket_pid_map = Self::build_socket_pid_map();
+        let tcp_entries = Self::read_tcp_entries();
+        *self.socket_scan_cache.borrow_mut() = Some(SocketScanCache {
+            scanned_at: now,
+            socket_pid_map: socket_pid_map.clone(),
+            tcp_entries: tcp_entries.clone(),
+        });
+        (socket_pid_map, tcp_entries)
     }
 }
 
@@ -297,7 +329,7 @@ impl SystemCollector for LinuxCollector {
     fn get_socket_stats(&self) -> SocketOverviewInfo {
         let mut info = SocketOverviewInfo::default();
 
-        let tcp_entries = Self::read_tcp_entries();
+        let (socket_pid_map, tcp_entries) = self.get_socket_scan();
 
         // ── aggregate state counts ──
         for &(_inode, st) in &tcp_entries {
@@ -312,7 +344,6 @@ impl SystemCollector for LinuxCollector {
         }
 
         // ── top processes by active connection count ──
-        let socket_pid_map = Self::build_socket_pid_map();
         let mut proc_counts: HashMap<String, u32> = HashMap::new();
 
         for &(inode, st) in &tcp_entries {
@@ -428,8 +459,7 @@ impl SystemCollector for LinuxCollector {
 
                 if total_delta_rx > 0 || total_delta_tx > 0 {
                     // ── map ESTABLISHED sockets to PIDs ──
-                    let socket_pid_map = Self::build_socket_pid_map();
-                    let tcp_entries = Self::read_tcp_entries();
+                    let (socket_pid_map, tcp_entries) = self.get_socket_scan();
 
                     let mut pid_conn_count: HashMap<u32, u64> = HashMap::new();
                     let mut total_conns: u64 = 0;
