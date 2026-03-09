@@ -10,7 +10,7 @@ pub mod linux;
 
 /// Trait for OS-specific system data collection.
 /// Implementations (MacCollector, LinuxCollector) handle the low-level details.
-pub trait SystemCollector {
+pub trait SystemCollector: Send {
     /// Collect disk I/O statistics (e.g. busy %, read/write rates).
     /// Returns a tuple of (busy_percent, additional_stats if any).
     /// Note: Currently we only really use busy_percent broadly, but structure allows expansion.

@@ -96,6 +96,9 @@ pub fn run(should_quit: Arc<AtomicBool>) -> io::Result<()> {
         if app.expire_pending_action() {
             needs_render = true;
         }
+        if app.monitor.poll_update() {
+            needs_render = true;
+        }
         if app.process_tick() {
             needs_render = true;
         }

@@ -4,6 +4,8 @@ mod process;
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 
 use chrono::Local;
@@ -17,16 +19,26 @@ use crate::model::{
 };
 
 pub struct Monitor {
+    pub ui_state: UIState,
+    pub layout: Layout,
+    pub last_data: Option<MonitorData>,
+    worker_state: Option<MonitorWorkerState>,
+    update_receiver: Option<mpsc::Receiver<MonitorUpdateResult>>,
+}
+
+struct MonitorWorkerState {
     sys: System,
     core_count: f64,
     history: VecDeque<(Instant, HashMap<Pid, ProcessGroup>)>,
     disks: Disks,
     networks: Networks,
     prev_net_snapshot: Option<(Instant, Vec<(String, u64, u64)>)>,
-    pub ui_state: UIState,
-    pub layout: Layout,
-    pub last_data: Option<MonitorData>,
     collector: Box<dyn SystemCollector>,
+}
+
+struct MonitorUpdateResult {
+    worker_state: MonitorWorkerState,
+    data: MonitorData,
 }
 
 impl Monitor {
@@ -44,20 +56,64 @@ impl Monitor {
         };
 
         Self {
-            sys,
-            core_count,
-            history: VecDeque::new(),
-            disks,
-            networks,
-            prev_net_snapshot: None,
             ui_state: UIState::default(),
             layout: Layout::default_layout(),
             last_data: None,
-            collector,
+            worker_state: Some(MonitorWorkerState {
+                sys,
+                core_count,
+                history: VecDeque::new(),
+                disks,
+                networks,
+                prev_net_snapshot: None,
+                collector,
+            }),
+            update_receiver: None,
         }
     }
 
     pub fn update(&mut self) {
+        if self.update_receiver.is_some() {
+            return;
+        }
+
+        let Some(mut worker_state) = self.worker_state.take() else {
+            return;
+        };
+        let sort_column = self.ui_state.sort_column;
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let data = worker_state.collect_snapshot(sort_column);
+            let _ = tx.send(MonitorUpdateResult { worker_state, data });
+        });
+
+        self.update_receiver = Some(rx);
+    }
+
+    pub fn poll_update(&mut self) -> bool {
+        let Some(ref rx) = self.update_receiver else {
+            return false;
+        };
+
+        match rx.try_recv() {
+            Ok(result) => {
+                self.worker_state = Some(result.worker_state);
+                self.last_data = Some(result.data);
+                self.update_receiver = None;
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.update_receiver = None;
+                false
+            }
+        }
+    }
+}
+
+impl MonitorWorkerState {
+    fn collect_snapshot(&mut self, sort_column: crate::model::SortColumn) -> MonitorData {
         self.sys.refresh_all();
         self.disks.refresh(true);
         self.networks.refresh(true);
@@ -79,8 +135,7 @@ impl Monitor {
             self.history.pop_front();
         }
 
-        let historical_top =
-            process::compute_top_processes(&self.history, self.ui_state.sort_column);
+        let historical_top = process::compute_top_processes(&self.history, sort_column);
 
         let memory = MemoryInfo {
             total: self.sys.total_memory(),
@@ -150,7 +205,7 @@ impl Monitor {
             close_wait: socket_info.close_wait,
         };
 
-        self.last_data = Some(MonitorData {
+        MonitorData {
             time: now_chrono.format("%H:%M:%S").to_string(),
             core_count: self.core_count,
             load_avg: (load_avg_raw.one, load_avg_raw.five, load_avg_raw.fifteen),
@@ -162,6 +217,6 @@ impl Monitor {
             fd_info,
             context_switches: csw_info,
             socket_overview: socket_info,
-        });
+        }
     }
 }
