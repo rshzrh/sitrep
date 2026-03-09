@@ -7,11 +7,18 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct MacCollector {
     /// Cached nettop results, updated by a background thread every ~2 seconds.
     nettop_cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>>,
+    command_cache: Mutex<MacCommandCache>,
+}
+
+struct MacCommandCache {
+    fd_info: Option<(Instant, FdInfo)>,
+    socket_info: Option<(Instant, SocketOverviewInfo)>,
+    context_switches: Option<(Instant, ContextSwitchInfo)>,
 }
 
 impl MacCollector {
@@ -30,11 +37,131 @@ impl MacCollector {
             }
         });
 
-        Self { nettop_cache: cache }
+        Self {
+            nettop_cache: cache,
+            command_cache: Mutex::new(MacCommandCache {
+                fd_info: None,
+                socket_info: None,
+                context_switches: None,
+            }),
+        }
     }
 
     fn parse_sysctl_value(output: &str) -> u64 {
         output.split(":").nth(1).unwrap_or("0").trim().parse().unwrap_or(0)
+    }
+
+    fn command_cache_ttl() -> Duration {
+        Duration::from_secs(15)
+    }
+
+    fn get_cached<T: Clone>(
+        &self,
+        slot: &mut Option<(Instant, T)>,
+        compute: impl FnOnce() -> T,
+    ) -> T {
+        let now = Instant::now();
+        if let Some((cached_at, value)) = slot.as_ref() {
+            if now.duration_since(*cached_at) < Self::command_cache_ttl() {
+                return value.clone();
+            }
+        }
+
+        let value = compute();
+        *slot = Some((now, value.clone()));
+        value
+    }
+
+    fn compute_fd_stats(&self) -> FdInfo {
+        let mut info = FdInfo::default();
+
+        if let Ok(output) = Command::new("sysctl").arg("kern.num_files").output() {
+            info.system_used = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
+        }
+        if let Ok(output) = Command::new("sysctl").arg("kern.maxfiles").output() {
+            info.system_max = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
+        }
+
+        let cmd = "lsof -n -P | awk '{print $1}' | sort | uniq -c | sort -nr | head -5";
+        if let Ok(output) = Command::new("sh").arg("-c").arg(cmd).output() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            for line in out_str.lines() {
+                 let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                 if parts.len() >= 2 {
+                     let count: u64 = parts[0].parse().unwrap_or(0);
+                     let name = parts[1].to_string();
+                     info.top_processes.push((name, count));
+                 }
+            }
+        }
+
+        info
+    }
+
+    fn compute_socket_stats(&self) -> SocketOverviewInfo {
+        let mut established = 0u32;
+        let mut listen = 0u32;
+        let mut time_wait = 0u32;
+        let mut close_wait = 0u32;
+        let mut fin_wait = 0u32;
+
+        if let Ok(output) = Command::new("netstat").args(["-an", "-p", "tcp"]).output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains("ESTABLISHED") { established += 1; }
+                else if line.contains("LISTEN") { listen += 1; }
+                else if line.contains("TIME_WAIT") { time_wait += 1; }
+                else if line.contains("CLOSE_WAIT") { close_wait += 1; }
+                else if line.contains("FIN_WAIT") { fin_wait += 1; }
+            }
+        }
+
+        let mut process_conns: HashMap<String, u32> = HashMap::new();
+        if let Ok(output) = Command::new("lsof").args(["-i", "-n", "-P"]).output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines().skip(1) {
+                 if line.contains("ESTABLISHED") || line.contains("CLOSE_WAIT") || line.contains("LISTEN") {
+                     let parts: Vec<&str> = line.split_whitespace().collect();
+                     if let Some(name) = parts.first() {
+                         *process_conns.entry(name.to_string()).or_insert(0) += 1;
+                     }
+                 }
+            }
+        }
+
+        let mut top_processes: Vec<(String, u32)> = process_conns.into_iter().collect();
+        top_processes.sort_by(|a, b| b.1.cmp(&a.1));
+        top_processes.truncate(5);
+
+        SocketOverviewInfo { established, listen, time_wait, close_wait, fin_wait, top_processes }
+    }
+
+    fn compute_context_switches(&self) -> ContextSwitchInfo {
+        let mut total_csw = 0u64;
+        let mut top_processes = Vec::new();
+
+        if let Ok(output) = Command::new("ps").args(["-Acro", "comm,nivcsw"]).output() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines().skip(1) {
+                let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(csw) = parts.last().unwrap().parse::<u64>() {
+                        total_csw += csw;
+                        let name_parts = &parts[..parts.len()-1];
+                        let name = name_parts.join(" ");
+
+                        if csw > 0 {
+                            top_processes.push((name, csw));
+                        }
+                    }
+                }
+            }
+        }
+
+        top_processes.sort_by(|a, b| b.1.cmp(&a.1));
+        top_processes.truncate(5);
+
+        ContextSwitchInfo { total_csw, top_processes }
     }
 }
 
@@ -74,121 +201,18 @@ impl SystemCollector for MacCollector {
     }
 
     fn get_fd_stats(&self) -> FdInfo {
-        let mut info = FdInfo::default();
-
-        // System wide
-        if let Ok(output) = Command::new("sysctl").arg("kern.num_files").output() {
-            info.system_used = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
-        }
-        if let Ok(output) = Command::new("sysctl").arg("kern.maxfiles").output() {
-            info.system_max = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
-        }
-
-        // Top processes by open files (lsof)
-        // Note: This is slow. The original implementation used `lsof -i -n -P` for sockets, but for FDs?
-        // Ah, `render_fd_info` in view.rs uses `data.fd_info`.
-        // `controller.rs` snippet 390+ showed `collect_fd_info`? No, I didn't see it explicitly in the snippet I viewed (400-488).
-        // I saw `collect_context_switches` (400), `collect_process_network_stats` (423), `collect_socket_overview` (449).
-        // `FdInfo` was likely collected in another method or I missed it.
-        // Wait, looking at `controller.rs` around line 390 (implied):
-        // I need to assume logic similar to `collect_socket_overview` but for files.
-        // Usually `lsof | awk ...`.
-        // Since I don't have the exact source for `collect_fd_info`, I will implement a reasonable macOS version.
-        // `lsof -n -P` lists all open files.
-        
-        // Optimization: `lsof` is heavy. Maybe we skip it or use a faster method?
-        // But for parity, let's try to match.
-        // A common pattern is: `lsof -n -P | cut -d' ' -f1 | sort | uniq -c | sort -nr | head -5` via sh.
-        let cmd = "lsof -n -P | awk '{print $1}' | sort | uniq -c | sort -nr | head -5";
-        if let Ok(output) = Command::new("sh").arg("-c").arg(cmd).output() {
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            for line in out_str.lines() {
-                 let parts: Vec<&str> = line.trim().split_whitespace().collect();
-                 if parts.len() >= 2 {
-                     let count: u64 = parts[0].parse().unwrap_or(0);
-                     let name = parts[1].to_string();
-                     info.top_processes.push((name, count));
-                 }
-            }
-        }
-        info
+        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        self.get_cached(&mut cache.fd_info, || self.compute_fd_stats())
     }
 
     fn get_socket_stats(&self) -> SocketOverviewInfo {
-        let mut established = 0u32;
-        let mut listen = 0u32;
-        let mut time_wait = 0u32;
-        let mut close_wait = 0u32;
-        let mut fin_wait = 0u32;
-
-        if let Ok(output) = Command::new("netstat").args(["-an", "-p", "tcp"]).output() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if line.contains("ESTABLISHED") { established += 1; }
-                else if line.contains("LISTEN") { listen += 1; }
-                else if line.contains("TIME_WAIT") { time_wait += 1; }
-                else if line.contains("CLOSE_WAIT") { close_wait += 1; }
-                else if line.contains("FIN_WAIT") { fin_wait += 1; }
-            }
-        }
-
-        // Top processes by connection count
-        // Original logic used `lsof -i -n -P`.
-        let mut process_conns: HashMap<String, u32> = HashMap::new();
-        if let Ok(output) = Command::new("lsof").args(["-i", "-n", "-P"]).output() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines().skip(1) {
-                 // The original logic checked for states?
-                 // "if line.contains("ESTABLISHED") || ..."
-                 if line.contains("ESTABLISHED") || line.contains("CLOSE_WAIT") || line.contains("LISTEN") {
-                     let parts: Vec<&str> = line.split_whitespace().collect();
-                     if let Some(name) = parts.first() {
-                         *process_conns.entry(name.to_string()).or_insert(0) += 1;
-                     }
-                 }
-            }
-        }
-
-        let mut top_processes: Vec<(String, u32)> = process_conns.into_iter().collect();
-        top_processes.sort_by(|a, b| b.1.cmp(&a.1));
-        top_processes.truncate(5);
-
-        SocketOverviewInfo { established, listen, time_wait, close_wait, fin_wait, top_processes }
+        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        self.get_cached(&mut cache.socket_info, || self.compute_socket_stats())
     }
 
     fn get_context_switches(&self) -> ContextSwitchInfo {
-        let mut total_csw = 0u64;
-        let mut top_processes = Vec::new();
-
-        if let Ok(output) = Command::new("ps").args(["-Acro", "comm,nivcsw"]).output() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            // Skip header
-            for line in text.lines().skip(1) {
-                let parts: Vec<&str> = line.trim().split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(csw) = parts.last().unwrap().parse::<u64>() {
-                        total_csw += csw;
-                        // Determine name (everything before last column)
-                        let name_parts = &parts[..parts.len()-1];
-                        let name = name_parts.join(" "); // This effectively rejoins process names with spaces
-                        
-                        if csw > 0 {
-                            top_processes.push((name, csw));
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Original logic sorted and truncated manually?
-        // Wait, `ps -Acro` implies sort by what? `r`=cpu? `ps` doesn't natively sort by csw easily on mac.
-        // Controller logic (lines 417-418):
-        // top_processes.sort_by(...)
-        // top_processes.truncate(5)
-        top_processes.sort_by(|a, b| b.1.cmp(&a.1));
-        top_processes.truncate(5);
-
-        ContextSwitchInfo { total_csw, top_processes }
+        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        self.get_cached(&mut cache.context_switches, || self.compute_context_switches())
     }
 
     fn get_process_network_stats(&mut self) -> HashMap<Pid, (u64, u64)> {
