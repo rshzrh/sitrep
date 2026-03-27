@@ -6,6 +6,7 @@ use std::collections::HashSet;
 #[derive(Clone, Debug)]
 pub struct ProcessInfo {
     pub pid: Pid,
+    pub user: String,
     pub cpu: f32,
     pub mem: u64,
     pub read_bytes: u64,
@@ -18,6 +19,7 @@ pub struct ProcessInfo {
 #[derive(Clone, Debug)]
 pub struct ProcessGroup {
     pub pid: Pid,
+    pub user: String,
     pub cpu: f64,
     pub mem: u64,
     pub read_bytes: u64,

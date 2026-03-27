@@ -16,8 +16,17 @@ pub fn build_live_groups(
 
     for p in sys.processes().values() {
         let parent_pid = p.parent().unwrap_or(p.pid());
+        let user_name = p.user_id()
+            .and_then(|uid| {
+                sysinfo::Users::new_with_refreshed_list()
+                    .iter()
+                    .find(|u| u.id() == uid)
+                    .map(|u| u.name().to_string())
+            })
+            .unwrap_or_default();
         let group = live_groups.entry(parent_pid).or_insert_with(|| ProcessGroup {
             pid: parent_pid,
+            user: user_name.clone(),
             cpu: 0.0,
             mem: 0,
             read_bytes: 0,
@@ -40,6 +49,7 @@ pub fn build_live_groups(
 
         group.children.push(ProcessInfo {
             pid: p.pid(),
+            user: user_name,
             cpu: p.cpu_usage(),
             mem: p.memory(),
             read_bytes: p.disk_usage().read_bytes,
@@ -138,6 +148,7 @@ mod tests {
             Pid::from(1usize),
             ProcessGroup {
                 pid: Pid::from(1usize),
+                user: String::new(),
                 cpu: 50.0,
                 mem: 1000,
                 read_bytes: 100,
@@ -166,6 +177,7 @@ mod tests {
                 Pid::from(pid as usize),
                 ProcessGroup {
                     pid: Pid::from(pid as usize),
+                    user: String::new(),
                     cpu,
                     mem: 0,
                     read_bytes: 0,

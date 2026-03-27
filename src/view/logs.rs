@@ -1,16 +1,38 @@
 use crossterm::{
     cursor::MoveTo,
     execute, queue,
-    style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor},
+    style::{Attribute, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::io::{self, stdout, Write};
 
 use super::shared::safe_truncate;
+use super::theme::theme;
 use crate::model::{LogViewState, MultiLogViewState, ServiceLogState};
-use crate::view::shared::writeln;
+
+/// Render a themed help footer at the last row.
+fn render_help_footer(out: &mut impl Write, items: &[(&str, &str)], width: usize, y: u16) -> io::Result<()> {
+    let t = theme();
+    queue!(out, MoveTo(1, y))?;
+    for (i, (key, desc)) in items.iter().enumerate() {
+        if i > 0 {
+            queue!(out, SetForegroundColor(t.help_desc))?;
+            write!(out, "  ")?;
+        }
+        queue!(out, SetForegroundColor(t.help_key))?;
+        write!(out, "{}", key)?;
+        queue!(out, SetForegroundColor(t.help_desc))?;
+        write!(out, ":{}", desc)?;
+    }
+    let content_len: usize = items.iter().map(|(k, d)| k.len() + 1 + d.len()).sum::<usize>() + (items.len().saturating_sub(1)) * 2;
+    let remaining = width.saturating_sub(content_len + 1);
+    write!(out, "{:remaining$}", "", remaining = remaining)?;
+    queue!(out, ResetColor)?;
+    Ok(())
+}
 
 pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
+    let t = theme();
     let mut out = stdout();
     execute!(out, Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
 
@@ -18,7 +40,7 @@ pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
     let width = size.0 as usize;
     let height = size.1 as usize;
 
-    // Header
+    // Header bar with mauve background
     let follow_indicator = if log_state.auto_follow {
         "FOLLOWING"
     } else {
@@ -39,21 +61,25 @@ pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
         log_state.container_name, log_state.container_id, follow_indicator, search_indicator, truncated_indicator
     );
 
-    queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
-    if !log_state.auto_follow {
-        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
-    }
-    write!(out, "{}\r\n", header)?;
+    queue!(
+        io::stdout(),
+        SetBackgroundColor(t.tab_active_bg),
+        SetForegroundColor(t.tab_active_fg),
+        SetAttribute(Attribute::Bold)
+    )?;
+    // Pad header to full width
+    write!(out, "{:<width$}\r\n", header, width = width)?;
     queue!(io::stdout(), SetAttribute(Attribute::Reset), ResetColor)?;
 
+    // Render truncated count in peach if present (already shown in header)
     // Search prompt line (if active)
     if log_state.search_mode {
-        queue!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+        queue!(io::stdout(), SetForegroundColor(t.teal))?;
         write!(out, "  Search: {}_\r\n", log_state.search_query)?;
         queue!(io::stdout(), ResetColor)?;
     } else {
         let sep: String = "─".repeat(width);
-        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        queue!(io::stdout(), SetForegroundColor(t.separator))?;
         write!(out, "{}\r\n", sep)?;
         queue!(io::stdout(), ResetColor)?;
     }
@@ -79,11 +105,13 @@ pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
                     let full_line = format!("{}{}", prefix, line);
                     let display_line = safe_truncate(&full_line, width);
                     if has_search {
-                        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                        queue!(io::stdout(), SetForegroundColor(t.yellow))?;
                         write!(out, "{}\r\n", display_line)?;
                         queue!(io::stdout(), ResetColor)?;
                     } else {
+                        queue!(io::stdout(), SetForegroundColor(t.text))?;
                         write!(out, "{}\r\n", display_line)?;
+                        queue!(io::stdout(), ResetColor)?;
                     }
                     lines_printed += 1;
                 }
@@ -97,21 +125,29 @@ pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
     }
 
     // Footer
-    let help = if log_state.search_mode {
-        "Type to search | Enter: Confirm | Esc: Cancel"
-    } else if has_search {
-        "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | /: Search | n: Clear search"
-    } else {
-        "q/Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow | /: Search"
-    };
     let help_y = (height.saturating_sub(1)) as u16;
-    queue!(
-        out,
-        MoveTo(1, help_y),
-        SetForegroundColor(Color::DarkGrey),
-        crossterm::style::Print(format!("{:<width$}", help, width = width)),
-        ResetColor
-    )?;
+    if log_state.search_mode {
+        render_help_footer(&mut out, &[
+            ("Type", "search"),
+            ("Enter", "Confirm"),
+            ("Esc", "Cancel"),
+        ], width, help_y)?;
+    } else if has_search {
+        render_help_footer(&mut out, &[
+            ("q/Esc/←", "Back"),
+            ("↑↓", "Scroll"),
+            ("f/End", "Follow"),
+            ("/", "Search"),
+            ("n", "Clear search"),
+        ], width, help_y)?;
+    } else {
+        render_help_footer(&mut out, &[
+            ("q/Esc/←", "Back"),
+            ("↑↓", "Scroll"),
+            ("f/End", "Follow"),
+            ("/", "Search"),
+        ], width, help_y)?;
+    }
 
     out.flush()?;
     Ok(())
@@ -121,6 +157,7 @@ pub fn render_multi_container_logs(
     log_state: &MultiLogViewState,
     active_container_names: &[String],
 ) -> io::Result<()> {
+    let t = theme();
     let mut out = stdout();
     execute!(out, Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
 
@@ -149,28 +186,30 @@ pub fn render_multi_container_logs(
         container_count, follow_indicator, search_indicator, truncated_indicator
     );
 
-    queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
-    if !log_state.auto_follow {
-        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
-    }
-    write!(out, "{}\r\n", header)?;
+    queue!(
+        io::stdout(),
+        SetBackgroundColor(t.tab_active_bg),
+        SetForegroundColor(t.tab_active_fg),
+        SetAttribute(Attribute::Bold)
+    )?;
+    write!(out, "{:<width$}\r\n", header, width = width)?;
     queue!(io::stdout(), SetAttribute(Attribute::Reset), ResetColor)?;
 
     // On-screen indicator for active multi-container streams
     if !active_container_names.is_empty() {
         let names = active_container_names.join(", ");
-        queue!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+        queue!(io::stdout(), SetForegroundColor(t.teal))?;
         writeln!(&mut out, "  Streaming: {}", names)?;
         queue!(io::stdout(), ResetColor)?;
     }
 
     if log_state.search_mode {
-        queue!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+        queue!(io::stdout(), SetForegroundColor(t.teal))?;
         write!(out, "  Search: {}_\r\n", log_state.search_query)?;
         queue!(io::stdout(), ResetColor)?;
     } else {
         let sep: String = "─".repeat(width);
-        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        queue!(io::stdout(), SetForegroundColor(t.separator))?;
         write!(out, "{}\r\n", sep)?;
         queue!(io::stdout(), ResetColor)?;
     }
@@ -194,11 +233,13 @@ pub fn render_multi_container_logs(
                     let full_line = format!("{}: {}", entry.container_name, entry.line);
                     let display_line = safe_truncate(&full_line, width);
                     if has_search {
-                        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                        queue!(io::stdout(), SetForegroundColor(t.yellow))?;
                         write!(out, "{}\r\n", display_line)?;
                         queue!(io::stdout(), ResetColor)?;
                     } else {
+                        queue!(io::stdout(), SetForegroundColor(t.text))?;
                         write!(out, "{}\r\n", display_line)?;
+                        queue!(io::stdout(), ResetColor)?;
                     }
                     lines_printed += 1;
                 }
@@ -211,27 +252,36 @@ pub fn render_multi_container_logs(
         write!(out, "\r\n")?;
     }
 
-    let help = if log_state.search_mode {
-        "Type to search | Enter: Confirm | Esc: Cancel"
-    } else if has_search {
-        "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | /: Search | n: Clear search"
-    } else {
-        "q/Esc/←: Back | ↑/↓: Scroll (pauses follow) | f/End: Resume follow | /: Search"
-    };
     let help_y = (height.saturating_sub(1)) as u16;
-    queue!(
-        out,
-        MoveTo(1, help_y),
-        SetForegroundColor(Color::DarkGrey),
-        crossterm::style::Print(format!("{:<width$}", help, width = width)),
-        ResetColor
-    )?;
+    if log_state.search_mode {
+        render_help_footer(&mut out, &[
+            ("Type", "search"),
+            ("Enter", "Confirm"),
+            ("Esc", "Cancel"),
+        ], width, help_y)?;
+    } else if has_search {
+        render_help_footer(&mut out, &[
+            ("q/Esc/←", "Back"),
+            ("↑↓", "Scroll"),
+            ("f/End", "Follow"),
+            ("/", "Search"),
+            ("n", "Clear search"),
+        ], width, help_y)?;
+    } else {
+        render_help_footer(&mut out, &[
+            ("q/Esc/←", "Back"),
+            ("↑↓", "Scroll"),
+            ("f/End", "Follow"),
+            ("/", "Search"),
+        ], width, help_y)?;
+    }
 
     out.flush()?;
     Ok(())
 }
 
 pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
+    let t = theme();
     let mut out = stdout();
     execute!(out, Clear(ClearType::All), crossterm::cursor::MoveTo(0, 0))?;
 
@@ -239,7 +289,7 @@ pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
     let width = size.0 as usize;
     let height = size.1 as usize;
 
-    // Header
+    // Header bar with mauve background
     let follow_indicator = if log_state.auto_follow {
         "FOLLOWING"
     } else {
@@ -270,20 +320,22 @@ pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
         truncated_indicator
     );
 
-    queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
-    if !log_state.auto_follow {
-        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
-    }
-    write!(out, "{}\r\n", header)?;
+    queue!(
+        io::stdout(),
+        SetBackgroundColor(t.tab_active_bg),
+        SetForegroundColor(t.tab_active_fg),
+        SetAttribute(Attribute::Bold)
+    )?;
+    write!(out, "{:<width$}\r\n", header, width = width)?;
     queue!(io::stdout(), SetAttribute(Attribute::Reset), ResetColor)?;
 
     if log_state.search_mode {
-        queue!(io::stdout(), SetForegroundColor(Color::Cyan))?;
+        queue!(io::stdout(), SetForegroundColor(t.teal))?;
         write!(out, "  Search: {}_\r\n", log_state.search_query)?;
         queue!(io::stdout(), ResetColor)?;
     } else {
         let sep: String = "─".repeat(width);
-        queue!(io::stdout(), SetForegroundColor(Color::DarkGrey))?;
+        queue!(io::stdout(), SetForegroundColor(t.separator))?;
         write!(out, "{}\r\n", sep)?;
         queue!(io::stdout(), ResetColor)?;
     }
@@ -312,17 +364,16 @@ pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
                     let is_match = has_search && lower.contains(&log_state.search_query.to_lowercase());
 
                     if is_error {
-                        queue!(io::stdout(), SetForegroundColor(Color::Red))?;
+                        queue!(io::stdout(), SetForegroundColor(t.red))?;
                     } else if is_match {
-                        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
+                        queue!(io::stdout(), SetForegroundColor(t.yellow))?;
+                    } else {
+                        queue!(io::stdout(), SetForegroundColor(t.text))?;
                     }
 
                     let display_line = safe_truncate(line, width);
                     write!(out, "{}\r\n", display_line)?;
-
-                    if is_error || is_match {
-                        queue!(io::stdout(), ResetColor)?;
-                    }
+                    queue!(io::stdout(), ResetColor)?;
                     lines_printed += 1;
                 }
             }
@@ -334,21 +385,31 @@ pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
         write!(out, "\r\n")?;
     }
 
-    let help = if log_state.search_mode {
-        "Type to search | Enter: Confirm | Esc: Cancel"
-    } else if has_search {
-        "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Errors | /: Search | n: Clear search"
-    } else {
-        "q/Esc/←: Back | ↑/↓: Scroll | f/End: Follow | e: Toggle Error Filter | /: Search"
-    };
     let help_y = (height.saturating_sub(1)) as u16;
-    queue!(
-        out,
-        MoveTo(1, help_y),
-        SetForegroundColor(Color::DarkGrey),
-        crossterm::style::Print(format!("{:<width$}", help, width = width)),
-        ResetColor
-    )?;
+    if log_state.search_mode {
+        render_help_footer(&mut out, &[
+            ("Type", "search"),
+            ("Enter", "Confirm"),
+            ("Esc", "Cancel"),
+        ], width, help_y)?;
+    } else if has_search {
+        render_help_footer(&mut out, &[
+            ("q/Esc/←", "Back"),
+            ("↑↓", "Scroll"),
+            ("f/End", "Follow"),
+            ("e", "Errors"),
+            ("/", "Search"),
+            ("n", "Clear search"),
+        ], width, help_y)?;
+    } else {
+        render_help_footer(&mut out, &[
+            ("q/Esc/←", "Back"),
+            ("↑↓", "Scroll"),
+            ("f/End", "Follow"),
+            ("e", "Toggle Errors"),
+            ("/", "Search"),
+        ], width, help_y)?;
+    }
 
     out.flush()?;
     Ok(())

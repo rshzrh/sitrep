@@ -5,6 +5,7 @@ mod shared;
 mod swarm;
 mod system;
 mod tab_bar;
+pub mod theme;
 
 use crate::layout::SectionId;
 use crossterm::{

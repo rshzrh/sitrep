@@ -1,462 +1,439 @@
 use crossterm::{
     cursor::MoveTo,
     queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{Attribute, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
 };
 use std::io::{self, stdout, Write};
 use sysinfo::Pid;
 
 use super::shared::{
-    format_bytes_rate, format_number, progress_bar, write_section_header, write_selectable, writeln,
+    format_bytes_rate, format_mem_human, load_avg_color, render_bar, render_help_footer,
 };
+use super::theme::theme;
 use super::RowKind;
-use crate::layout::{Layout, SectionId};
+use crate::layout::Layout;
 use crate::model::{MonitorData, SortColumn, UIState};
 
 pub fn render(
     data: &MonitorData,
     ui_state: &mut UIState,
-    layout: &Layout,
+    _layout: &Layout,
 ) -> io::Result<Vec<(Pid, RowKind)>> {
     let mut out = stdout();
     let mut rows: Vec<(Pid, RowKind)> = Vec::new();
     let mut current_row: usize = 0;
-
-    queue!(out, SetAttribute(Attribute::Bold))?;
-    writeln(&mut out, "  System")?;
-    queue!(out, SetAttribute(Attribute::Reset))?;
-    writeln(
-        &mut out,
-        &format!("  {}  |  Cores: {}", data.time, data.core_count),
-    )?;
-    writeln(&mut out, "")?;
-
-    for section in &layout.sections {
-        if section.id == SectionId::Summary {
-            rows.push((Pid::from(0), RowKind::SectionHeader(section.id)));
-            current_row += 1;
-            render_summary(&mut out, data)?;
-            continue;
-        }
-
-        let indicator = if section.collapsed { "▶" } else { "▼" };
-        let header = format!("{} --- {} ---", indicator, section.title);
-
-        write_section_header(&mut out, &header, current_row == ui_state.selected_index)?;
-        rows.push((Pid::from(0), RowKind::SectionHeader(section.id)));
-        current_row += 1;
-
-        if section.collapsed {
-            continue;
-        }
-
-        match section.id {
-            SectionId::Summary => {}
-            SectionId::Processes => {
-                render_processes(&mut out, data, ui_state, &mut rows, &mut current_row)?;
-            }
-            SectionId::Network => render_network(&mut out, data)?,
-            SectionId::FileDescriptors => render_fd_info(&mut out, data)?,
-            SectionId::SocketOverview => render_socket_overview(&mut out, data)?,
-        }
-        writeln(&mut out, "")?;
-    }
-
-    ui_state.total_rows = current_row;
-
+    let t = theme();
     let size = crossterm::terminal::size()?;
-    let help = "q: Quit | Ctrl+C: Force Quit | Tab: Switch | ↑/↓: Navigate | →/←: Expand/Collapse | Sort: (c)pu (m)em (r)ead (w)rite (d)ownload (u)pload";
-    let help_y = size.1.saturating_sub(1);
-    queue!(
-        out,
-        MoveTo(1, help_y),
-        SetForegroundColor(Color::DarkGrey),
-        Print(format!("{:<width$}", help, width = size.0 as usize)),
-        ResetColor
-    )?;
+    let term_width = size.0 as usize;
 
-    if ui_state.has_expansions() {
-        queue!(out, SetForegroundColor(Color::Yellow))?;
-        writeln(&mut out, "(Expanded section data frozen)")?;
-        queue!(out, ResetColor)?;
-    }
+    // ── Top panel: CPU / Mem / Swap bars with right-side stats ──
 
-    out.flush()?;
-    Ok(rows)
-}
+    let bar_width: usize = 40;
 
-fn render_summary(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
-    writeln(
-        out,
-        "────────────────────────────────────────────────────────────────────────────────",
-    )?;
+    // CPU bar
+    let cpu_total: f64 = data
+        .historical_top
+        .iter()
+        .map(|p| p.cpu)
+        .sum::<f64>();
+    let cpu_pct = (cpu_total / (data.core_count * 100.0) * 100.0).min(100.0);
+    render_bar(&mut out, "CPU", cpu_pct, "", bar_width)?;
 
-    let (l1, l5, l15) = data.load_avg;
-    let cores = data.core_count;
-    let mut load_line = String::from("LOAD   ");
+    // Right side: Tasks + Load average (on the same line as CPU bar)
+    let task_count = data.historical_top.len();
+    let right_col = bar_width + 3 + 5 + 8; // label(5) + bar + bracket(2) + percent(7) + spacing
+    let right_start = right_col + 2;
+    if right_start < term_width {
+        queue!(out, SetForegroundColor(t.subtext))?;
+        write!(out, "    Tasks: ", )?;
+        queue!(out, SetForegroundColor(t.text))?;
+        write!(out, "{:<6}", task_count)?;
 
-    for (label, val) in [("1m:", l1), ("5m:", l5), ("15m:", l15)] {
-        load_line.push_str(&format!("{} ", label));
-        if val > cores {
-            load_line.push_str(&format!("\x1b[31m{:.2}\x1b[0m  ", val));
-        } else {
-            load_line.push_str(&format!("{:.2}  ", val));
+        queue!(out, SetForegroundColor(t.subtext))?;
+        write!(out, "Load average: ")?;
+
+        let (l1, l5, l15) = data.load_avg;
+        let cores = data.core_count;
+        for (i, val) in [l1, l5, l15].iter().enumerate() {
+            let color = load_avg_color(*val, cores);
+            queue!(out, SetForegroundColor(color))?;
+            write!(out, "{:.2}", val)?;
+            queue!(out, ResetColor)?;
+            if i < 2 {
+                write!(out, " ")?;
+            }
         }
     }
+    queue!(out, ResetColor)?;
+    write!(out, "\r\n")?;
 
-    let overload_status = if l1 > cores && l5 > cores && l15 > cores {
-        "\x1b[31moverload: all\x1b[0m"
-    } else if l1 > cores && l5 > cores {
-        "\x1b[31moverload: 1m+5m\x1b[0m"
-    } else if l1 > cores {
-        "\x1b[31moverload: 1m\x1b[0m"
-    } else {
-        "overload: none"
-    };
-    load_line.push_str(&format!("│ cores: {}  │ {}", cores as u32, overload_status));
-    writeln(out, &load_line)?;
-
+    // Mem bar
     let m = &data.memory;
-    let total_gb = m.total as f64 / 1_073_741_824.0;
-    let used_gb = m.used as f64 / 1_073_741_824.0;
-    let avail_gb = m.available as f64 / 1_073_741_824.0;
-    let pct_used = if m.total > 0 {
+    let mem_pct = if m.total > 0 {
         (m.used as f64 / m.total as f64) * 100.0
     } else {
         0.0
     };
+    let mem_used_gb = m.used as f64 / 1_073_741_824.0;
+    let mem_total_gb = m.total as f64 / 1_073_741_824.0;
+    let mem_detail = format!("{:.1}G/{:.1}G", mem_used_gb, mem_total_gb);
+    render_bar(&mut out, "Mem", mem_pct, &mem_detail, bar_width)?;
 
-    let mem_bar = progress_bar(pct_used, 20);
-    let mem_color = if pct_used > 85.0 {
-        "\x1b[31m"
-    } else if pct_used > 70.0 {
-        "\x1b[33m"
-    } else {
-        ""
-    };
-    writeln(
-        out,
-        &format!(
-            "MEM    {}{}\x1b[0m {:.1}/{:.1} GB ({:.0}%)  │ avail: {:.1} GB",
-            mem_color, mem_bar, used_gb, total_gb, pct_used, avail_gb
-        ),
-    )?;
-
-    if m.swap_total > 0 {
-        let swap_total_gb = m.swap_total as f64 / 1_073_741_824.0;
-        let swap_used_gb = m.swap_used as f64 / 1_073_741_824.0;
-        let swap_pct = (m.swap_used as f64 / m.swap_total as f64) * 100.0;
-        let swap_bar = progress_bar(swap_pct, 20);
-
-        let swap_color = if swap_pct > 50.0 {
-            "\x1b[31m"
-        } else if swap_pct > 20.0 {
-            "\x1b[33m"
-        } else {
-            ""
-        };
-        writeln(
-            out,
-            &format!(
-                "SWAP   {}{}\x1b[0m {:.1}/{:.1} GB ({:.0}%)",
-                swap_color, swap_bar, swap_used_gb, swap_total_gb, swap_pct
-            ),
-        )?;
-    } else {
-        writeln(out, "SWAP   none")?;
+    // Right side: Uptime
+    if !data.time.is_empty() {
+        queue!(out, SetForegroundColor(t.subtext))?;
+        write!(out, "              Uptime: ")?;
+        queue!(out, SetForegroundColor(t.text))?;
+        write!(out, "{}", data.time)?;
     }
+    queue!(out, ResetColor)?;
+    write!(out, "\r\n")?;
 
-    if data.disk_space.is_empty() {
-        writeln(out, "DISK   all disks > 10% free")?;
+    // Swap bar
+    if m.swap_total > 0 {
+        let swap_pct = (m.swap_used as f64 / m.swap_total as f64) * 100.0;
+        let swap_used_gb = m.swap_used as f64 / 1_073_741_824.0;
+        let swap_total_gb = m.swap_total as f64 / 1_073_741_824.0;
+        let swap_detail = format!("{:.1}G/{:.1}G", swap_used_gb, swap_total_gb);
+        render_bar(&mut out, "Swp", swap_pct, &swap_detail, bar_width)?;
     } else {
-        for (idx, d) in data.disk_space.iter().enumerate() {
-            let label = if idx == 0 { "DISK   " } else { "       " };
-            let used_gb = d.total_gb - d.available_gb;
-            let pct_used = 100.0 - d.percent_free;
-            let disk_bar = progress_bar(pct_used, 20);
+        queue!(out, SetForegroundColor(t.subtext))?;
+        write!(out, " Swp [no swap]")?;
+    }
+    queue!(out, ResetColor)?;
+    write!(out, "\r\n")?;
 
-            let warning = if d.percent_free < 10.0 {
-                " \x1b[31m⚠ LOW\x1b[0m"
-            } else if d.percent_free < 20.0 {
-                " \x1b[33m⚠ LOW\x1b[0m"
+    // ── Disk usage ──
+    if !data.disk_space.is_empty() {
+        for disk in &data.disk_space {
+            let used_gb = disk.total_gb - disk.available_gb;
+            let used_pct = if disk.total_gb > 0.0 {
+                (used_gb / disk.total_gb) * 100.0
             } else {
-                ""
+                0.0
+            };
+            let label = if disk.mount_point.len() <= 10 {
+                format!(" {} ", disk.mount_point)
+            } else {
+                let short: String = disk.mount_point.chars().take(8).collect();
+                format!(" {}.. ", short)
+            };
+            let detail = format!("{:.1}G/{:.1}G", used_gb, disk.total_gb);
+
+            // Color the bar based on usage
+            let bar_color = if used_pct > 90.0 {
+                t.red
+            } else if used_pct > 75.0 {
+                t.peach
+            } else {
+                t.bar_filled
             };
 
-            writeln(
-                out,
-                &format!(
-                    "{}{:<10} {} {:.1}/{:.1} GB ({:.0}% free){}",
-                    label, d.mount_point, disk_bar, used_gb, d.total_gb, d.percent_free, warning
-                ),
-            )?;
+            // Render disk bar manually with custom color
+            let filled = ((used_pct / 100.0) * bar_width as f64).round() as usize;
+            let empty = bar_width.saturating_sub(filled);
+
+            queue!(out, SetForegroundColor(t.subtext))?;
+            write!(out, "{:<4}", label.chars().take(4).collect::<String>())?;
+            queue!(out, SetForegroundColor(t.subtext))?;
+            write!(out, "[")?;
+            queue!(out, SetForegroundColor(bar_color))?;
+            write!(out, "{}", "|".repeat(filled))?;
+            queue!(out, SetBackgroundColor(t.bar_empty), SetForegroundColor(t.bar_empty))?;
+            write!(out, "{}", " ".repeat(empty))?;
+            queue!(out, ResetColor, SetForegroundColor(t.subtext))?;
+            write!(out, "]")?;
+            queue!(out, SetForegroundColor(t.text))?;
+            write!(out, " {:>5.1}%  ", used_pct)?;
+            queue!(out, SetForegroundColor(t.subtext))?;
+            write!(out, "{}", detail)?;
+
+            // Warning indicator
+            if used_pct > 90.0 {
+                queue!(out, SetForegroundColor(t.red))?;
+                write!(out, "  LOW")?;
+            } else if used_pct > 80.0 {
+                queue!(out, SetForegroundColor(t.peach))?;
+                write!(out, "  LOW")?;
+            }
+
+            // Disk I/O on the first disk line
+            if std::ptr::eq(disk, &data.disk_space[0]) && data.disk_busy_pct > 0.0 {
+                queue!(out, SetForegroundColor(t.subtext))?;
+                write!(out, "    I/O: ")?;
+                let io_color = if data.disk_busy_pct > 80.0 {
+                    t.red
+                } else if data.disk_busy_pct > 50.0 {
+                    t.peach
+                } else {
+                    t.text
+                };
+                queue!(out, SetForegroundColor(io_color))?;
+                write!(out, "{:.1}%", data.disk_busy_pct)?;
+            }
+
+            queue!(out, ResetColor)?;
+            write!(out, "\r\n")?;
         }
     }
 
-    writeln(out, &format!("IO     Busy: {:.1} MB/s", data.disk_busy_pct))?;
+    // ── Network interfaces ──
+    if !data.network.interfaces.is_empty() {
+        for iface in &data.network.interfaces {
+            let rx_str = format_bytes_rate(iface.rx_rate);
+            let tx_str = format_bytes_rate(iface.tx_rate);
 
-    let f = &data.fd_info;
-    let fd_pct = if f.system_max > 0 {
-        (f.system_used as f64 / f.system_max as f64) * 100.0
-    } else {
-        0.0
-    };
-    let fd_color = if fd_pct > 80.0 {
-        "\x1b[31m"
-    } else if fd_pct > 60.0 {
-        "\x1b[33m"
-    } else {
-        ""
-    };
-
-    let top_fd = f
-        .top_processes
-        .iter()
-        .take(3)
-        .map(|(name, count)| format!("{}({})", name, count))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    writeln(
-        out,
-        &format!(
-            "FD     {}{} / {} ({:.0}%)\x1b[0m  │ top: {}",
-            fd_color,
-            format_number(f.system_used),
-            format_number(f.system_max),
-            fd_pct,
-            top_fd
-        ),
-    )?;
-
-    let s = &data.socket_overview;
-    let time_wait_color = if s.time_wait > 100 { "\x1b[33m" } else { "" };
-    let close_wait_color = if s.close_wait > 10 { "\x1b[31m" } else { "" };
-
-    writeln(
-        out,
-        &format!(
-        "SOCK   EST: {}  LISTEN: {}  {}TIME_WAIT: {}\x1b[0m  {}CLOSE_WAIT: {}\x1b[0m  FIN_WAIT: {}",
-        s.established, s.listen, time_wait_color, s.time_wait,
-        close_wait_color, s.close_wait, s.fin_wait
-    ),
-    )?;
-
-    let n = &data.network;
-    if n.interfaces.is_empty() {
-        writeln(out, "NET    no active traffic")?;
-    } else {
-        for (idx, iface) in n.interfaces.iter().enumerate() {
-            let label = if idx == 0 { "NET    " } else { "       " };
-            writeln(
-                out,
-                &format!(
-                    "{}{:<10} ↓ {}  ↑ {}",
-                    label,
-                    iface.name,
-                    format_bytes_rate(iface.rx_rate),
-                    format_bytes_rate(iface.tx_rate)
-                ),
-            )?;
+            queue!(out, SetForegroundColor(t.subtext))?;
+            write!(out, " Net ")?;
+            queue!(out, SetForegroundColor(t.text))?;
+            write!(out, "{:<10}", iface.name)?;
+            queue!(out, SetForegroundColor(t.teal))?;
+            write!(out, " \u{2193}{:<10}", rx_str)?;
+            queue!(out, SetForegroundColor(t.peach))?;
+            write!(out, " \u{2191}{:<10}", tx_str)?;
+            queue!(out, ResetColor)?;
+            write!(out, "\r\n")?;
         }
     }
 
-    writeln(
-        out,
-        "────────────────────────────────────────────────────────────────────────────────",
-    )?;
+    // ── Socket summary (compact, single line) ──
+    let sock = &data.socket_overview;
+    if sock.established > 0 || sock.listen > 0 || sock.time_wait > 0 || sock.close_wait > 0 {
+        queue!(out, SetForegroundColor(t.subtext))?;
+        write!(out, " Sock ")?;
+        queue!(out, SetForegroundColor(t.text))?;
+        write!(out, "EST:{} ", sock.established)?;
+        write!(out, "LISTEN:{} ", sock.listen)?;
 
-    Ok(())
-}
+        if sock.time_wait > 100 {
+            queue!(out, SetForegroundColor(t.yellow))?;
+        }
+        write!(out, "TW:{} ", sock.time_wait)?;
+        queue!(out, SetForegroundColor(t.text))?;
 
-fn render_processes(
-    out: &mut impl Write,
-    data: &MonitorData,
-    ui_state: &UIState,
-    rows: &mut Vec<(Pid, RowKind)>,
-    current_row: &mut usize,
-) -> io::Result<()> {
-    write!(out, "  {:<18} ", "PID[CHILDREN]")?;
+        if sock.close_wait > 10 {
+            queue!(out, SetForegroundColor(t.red))?;
+        }
+        write!(out, "CW:{}", sock.close_wait)?;
 
-    let headers = [
-        ("CPU %", 8, Some(SortColumn::Cpu)),
-        ("MEM (MB)", 10, Some(SortColumn::Memory)),
-        ("READ/s", 10, Some(SortColumn::Read)),
-        ("WRITE/s", 10, Some(SortColumn::Write)),
-        ("NET ↓", 10, Some(SortColumn::NetDown)),
-        ("NET ↑", 10, Some(SortColumn::NetUp)),
-        ("Name", 0, None),
+        queue!(out, ResetColor)?;
+        write!(out, "\r\n")?;
+    }
+
+    // ── Separator line ──
+    queue!(out, SetForegroundColor(t.separator))?;
+    let sep: String = "\u{2500}".repeat(term_width);
+    write!(out, "{}\r\n", sep)?;
+    queue!(out, ResetColor)?;
+
+    // ── Process table header ──
+    let headers: &[(&str, usize, Option<SortColumn>)] = &[
+        ("PID", 7, None),
+        ("USER", 10, None),
+        ("CPU%", 6, Some(SortColumn::Cpu)),
+        ("MEM", 6, Some(SortColumn::Memory)),
+        ("NET I/O", 10, Some(SortColumn::NetDown)),
+        ("TIME+", 10, None),
+        ("Command", 0, None),
     ];
 
+    queue!(
+        out,
+        SetForegroundColor(t.header_fg),
+        SetAttribute(Attribute::Bold)
+    )?;
+
+    write!(out, "  ")?;
     for (text, width, col) in headers {
         let is_sorted = col.map_or(false, |c| c == ui_state.sort_column);
         if is_sorted {
-            queue!(out, SetAttribute(Attribute::Reverse))?;
+            queue!(
+                out,
+                SetBackgroundColor(t.surface),
+                SetForegroundColor(t.text)
+            )?;
         }
-        if width > 0 {
+        if *width > 0 {
             write!(out, "{:<width$} ", text, width = width)?;
         } else {
             write!(out, "{}", text)?;
         }
         if is_sorted {
-            queue!(out, SetAttribute(Attribute::Reset))?;
+            queue!(
+                out,
+                ResetColor,
+                SetForegroundColor(t.header_fg)
+            )?;
         }
     }
+    queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     write!(out, "\r\n")?;
 
+    // ── Process rows ──
     for g in &data.historical_top {
-        let pid_label = format!("{}[{}]", g.pid, g.child_count);
-        let mem_mb = g.mem as f64 / 1_048_576.0;
-        let read_fmt = format_bytes_rate(g.read_bytes);
-        let write_fmt = format_bytes_rate(g.written_bytes);
-        let net_rx_fmt = format_bytes_rate(g.net_rx_bytes);
-        let net_tx_fmt = format_bytes_rate(g.net_tx_bytes);
+        let mem_str = format_mem_human(g.mem);
+        let net_total = g.net_rx_bytes.saturating_add(g.net_tx_bytes);
+        let net_str = format_bytes_rate(net_total);
+        let time_str = "-".to_string(); // CPU time not directly available in model
 
-        let line = format!(
-            "  {:<18} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
-            pid_label, g.cpu, mem_mb, read_fmt, write_fmt, net_rx_fmt, net_tx_fmt, g.name
-        );
+        // Determine CPU color
+        let cpu_color = if g.cpu > 80.0 {
+            t.red
+        } else if g.cpu > 50.0 {
+            t.peach
+        } else {
+            t.text
+        };
 
-        write_selectable(out, &line, *current_row == ui_state.selected_index)?;
+        // Build the line: we need to color CPU specially, but write_selectable takes a string.
+        // For the selected row highlight we use write_selectable for the background,
+        // but we also want per-column colors. We'll do manual rendering.
+        let is_selected = current_row == ui_state.selected_index;
+
+        if is_selected {
+            queue!(out, SetBackgroundColor(t.selected_bg))?;
+        }
+
+        // PID
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
+        write!(out, "  {:<7}", g.pid)?;
+
+        // USER
+        let user_display = if g.user.len() > 9 {
+            &g.user[..9]
+        } else {
+            &g.user
+        };
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.subtext }))?;
+        write!(out, "{:<10} ", user_display)?;
+
+        // CPU%
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { cpu_color }))?;
+        write!(out, "{:<6.1}", g.cpu)?;
+
+        // MEM
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
+        write!(out, "{:<6} ", mem_str)?;
+
+        // NET I/O
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.subtext }))?;
+        write!(out, "{:<10} ", net_str)?;
+
+        // TIME+
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.subtext }))?;
+        write!(out, "{:<10} ", time_str)?;
+
+        // Command (fill remaining width)
+        let used_cols = 2 + 7 + 10 + 1 + 6 + 6 + 1 + 10 + 1 + 10 + 1;
+        let remaining = term_width.saturating_sub(used_cols);
+        let name = if g.name.len() > remaining {
+            &g.name[..remaining]
+        } else {
+            &g.name
+        };
+        queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
+        write!(out, "{}", name)?;
+
+        queue!(out, ResetColor)?;
+        write!(out, "\r\n")?;
+
         rows.push((g.pid, RowKind::ProcessParent));
-        *current_row += 1;
+        current_row += 1;
 
+        // Expanded children
         if ui_state.expanded_pids.contains(&g.pid) {
             for child in &g.children {
-                let child_read = format_bytes_rate(child.read_bytes);
-                let child_write = format_bytes_rate(child.written_bytes);
-                let child_net_rx = format_bytes_rate(child.net_rx_bytes);
-                let child_net_tx = format_bytes_rate(child.net_tx_bytes);
-
-                let child_line = format!(
-                    "    {:<16} {:<8.1} {:<10.1} {:<10} {:<10} {:<10} {:<10} {}",
-                    child.pid,
-                    child.cpu,
-                    child.mem as f64 / 1_048_576.0,
-                    child_read,
-                    child_write,
-                    child_net_rx,
-                    child_net_tx,
-                    child.name
+                let child_is_selected = current_row == ui_state.selected_index;
+                let child_mem = format_mem_human(child.mem);
+                let child_net = format_bytes_rate(
+                    child.net_rx_bytes.saturating_add(child.net_tx_bytes),
                 );
+                let child_cpu_color = if child.cpu as f64 > 80.0 {
+                    t.red
+                } else if child.cpu as f64 > 50.0 {
+                    t.peach
+                } else {
+                    t.text
+                };
 
-                write_selectable(out, &child_line, *current_row == ui_state.selected_index)?;
+                if child_is_selected {
+                    queue!(out, SetBackgroundColor(t.selected_bg))?;
+                }
+
+                // Indented PID
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
+                write!(out, "      {:<5}", child.pid)?;
+
+                // USER
+                let child_user = if child.user.len() > 9 {
+                    &child.user[..9]
+                } else {
+                    &child.user
+                };
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.subtext }))?;
+                write!(out, "{:<10} ", child_user)?;
+
+                // CPU%
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { child_cpu_color }))?;
+                write!(out, "{:<6.1}", child.cpu)?;
+
+                // MEM
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
+                write!(out, "{:<6} ", child_mem)?;
+
+                // NET I/O
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.subtext }))?;
+                write!(out, "{:<10} ", child_net)?;
+
+                // TIME+
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.subtext }))?;
+                write!(out, "{:<10} ", "-")?;
+
+                // Command
+                let child_remaining = term_width.saturating_sub(used_cols);
+                let child_name = if child.name.len() > child_remaining {
+                    &child.name[..child_remaining]
+                } else {
+                    &child.name
+                };
+                queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
+                write!(out, "{}", child_name)?;
+
+                queue!(out, ResetColor)?;
+                write!(out, "\r\n")?;
+
                 rows.push((child.pid, RowKind::ProcessChild));
-                *current_row += 1;
+                current_row += 1;
             }
         }
     }
-    Ok(())
-}
 
-fn render_network(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
-    let n = &data.network;
-    writeln(
-        out,
-        &format!(
-            "  Connections:  ESTABLISHED: {}  TIME_WAIT: {}  CLOSE_WAIT: {}",
-            n.established, n.time_wait, n.close_wait
-        ),
+    ui_state.total_rows = current_row;
+
+    // ── Help footer (last row) ──
+    let help_y = size.1.saturating_sub(1);
+    render_help_footer(
+        &mut out,
+        &[
+            ("q", "Quit"),
+            ("\u{2191}\u{2193}", "Select"),
+            ("Enter", "Expand"),
+            ("Tab", "Next"),
+            ("s", "Sort"),
+            ("/", "Search"),
+        ],
+        term_width,
+        help_y,
     )?;
 
-    if n.interfaces.is_empty() {
-        writeln(out, "  Bandwidth: No active traffic")?;
-    } else {
-        for iface in &n.interfaces {
-            writeln(
-                out,
-                &format!(
-                    "  {:<10}  ↓ {}  ↑ {}",
-                    iface.name,
-                    format_bytes_rate(iface.rx_rate),
-                    format_bytes_rate(iface.tx_rate)
-                ),
-            )?;
-        }
+    if ui_state.has_expansions() {
+        // Position just above help footer
+        let note_y = help_y.saturating_sub(1);
+        queue!(out, MoveTo(1, note_y), SetForegroundColor(t.yellow))?;
+        write!(out, "(Expanded section data frozen)")?;
+        queue!(out, ResetColor)?;
     }
 
-    if !n.top_bandwidth_processes.is_empty() {
-        writeln(out, "  Top processes by network connections:")?;
-        for p in &n.top_bandwidth_processes {
-            writeln(
-                out,
-                &format!("    {:<25} {} connections", p.name, p.bandwidth),
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn render_fd_info(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
-    let f = &data.fd_info;
-    let pct = if f.system_max > 0 {
-        (f.system_used as f64 / f.system_max as f64) * 100.0
-    } else {
-        0.0
-    };
-    let color = if pct > 80.0 {
-        Color::Red
-    } else if pct > 50.0 {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
-    queue!(io::stdout(), SetForegroundColor(color))?;
-    writeln(
-        out,
-        &format!(
-            "  System: {} / {} ({:.1}%)",
-            f.system_used, f.system_max, pct
-        ),
-    )?;
-    queue!(io::stdout(), ResetColor)?;
-    if !f.top_processes.is_empty() {
-        writeln(out, "  Top processes by open files:")?;
-        for (name, count) in &f.top_processes {
-            writeln(out, &format!("    {:<25} {}", name, count))?;
-        }
-    }
-    Ok(())
-}
-
-fn render_socket_overview(out: &mut impl Write, data: &MonitorData) -> io::Result<()> {
-    let s = &data.socket_overview;
-    writeln(
-        out,
-        &format!(
-            "  ESTABLISHED: {}  LISTEN: {}  TIME_WAIT: {}  CLOSE_WAIT: {}  FIN_WAIT: {}",
-            s.established, s.listen, s.time_wait, s.close_wait, s.fin_wait
-        ),
-    )?;
-
-    if s.close_wait > 10 {
-        queue!(io::stdout(), SetForegroundColor(Color::Red))?;
-        writeln(
-            out,
-            &format!(
-                "  ⚠ High CLOSE_WAIT count ({}) — possible connection leak",
-                s.close_wait
-            ),
-        )?;
-        queue!(io::stdout(), ResetColor)?;
-    }
-    if s.time_wait > 100 {
-        queue!(io::stdout(), SetForegroundColor(Color::Yellow))?;
-        writeln(
-            out,
-            &format!(
-                "  ⚠ High TIME_WAIT count ({}) — high connection churn",
-                s.time_wait
-            ),
-        )?;
-        queue!(io::stdout(), ResetColor)?;
-    }
-
-    if !s.top_processes.is_empty() {
-        writeln(out, "  Top processes by open connections:")?;
-        for (name, count) in &s.top_processes {
-            writeln(out, &format!("    {:<25} {}", name, count))?;
-        }
-    }
-    Ok(())
+    out.flush()?;
+    Ok(rows)
 }

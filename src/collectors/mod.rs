@@ -1,6 +1,5 @@
 use crate::model::{
-    DiskSpaceInfo, FdInfo, SocketOverviewInfo, ContextSwitchInfo, 
-    NetworkProcessInfo, NetworkInterfaceInfo
+    FdInfo, SocketOverviewInfo, ContextSwitchInfo,
 };
 use sysinfo::Pid;
 use std::collections::HashMap;
