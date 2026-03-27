@@ -2,6 +2,7 @@
 //!
 //! This library exposes the core modules for use by the binary and by tests.
 
+pub mod cli;
 pub mod model;
 pub mod view;
 pub mod layout;

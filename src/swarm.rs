@@ -18,7 +18,7 @@ pub struct LogStreamHandle {
 impl LogStreamHandle {
     /// Signal the child process to stop and drop resources.
     pub fn kill(&self) {
-        self.kill_flag.store(true, Ordering::Relaxed);
+        self.kill_flag.store(true, Ordering::Release);
     }
 }
 
@@ -308,6 +308,7 @@ pub fn force_update_service(service_id: &str) -> Result<(), String> {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
+        tracing::warn!("Docker force-update failed for {}: {}", service_id, err.trim());
         Err(err)
     }
 }
@@ -324,6 +325,7 @@ pub fn scale_service(service_id: &str, replicas: u32) -> Result<(), String> {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&output.stderr).to_string();
+        tracing::warn!("Docker scale failed for {} to {}: {}", service_id, replicas, err.trim());
         Err(err)
     }
 }
@@ -332,7 +334,7 @@ pub fn scale_service(service_id: &str, replicas: u32) -> Result<(), String> {
 /// and a kill mechanism. Call `handle.kill()` to terminate the child process
 /// and avoid zombie processes.
 pub fn tail_service_logs(service_id: &str) -> LogStreamHandle {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<String>(1000);
     let kill_flag = Arc::new(AtomicBool::new(false));
     let flag_clone = Arc::clone(&kill_flag);
 
@@ -357,8 +359,14 @@ pub fn tail_service_logs(service_id: &str) -> LogStreamHandle {
             }
         };
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
+        let Some(stdout) = child.stdout.take() else {
+            let _ = tx.send("[error] Failed to capture stdout from log stream".to_string());
+            return;
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = tx.send("[error] Failed to capture stderr from log stream".to_string());
+            return;
+        };
 
         // Read stdout in a separate thread
         let tx_stdout = tx.clone();
@@ -366,7 +374,7 @@ pub fn tail_service_logs(service_id: &str) -> LogStreamHandle {
         let stdout_handle = thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
-                if flag_stdout.load(Ordering::Relaxed) {
+                if flag_stdout.load(Ordering::Acquire) {
                     break;
                 }
                 match line {
@@ -383,7 +391,7 @@ pub fn tail_service_logs(service_id: &str) -> LogStreamHandle {
         // Read stderr in the current thread
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
-            if flag_clone.load(Ordering::Relaxed) {
+            if flag_clone.load(Ordering::Acquire) {
                 break;
             }
             match line {

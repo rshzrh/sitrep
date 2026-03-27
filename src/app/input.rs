@@ -247,6 +247,9 @@ fn handle_containers(
         KeyCode::Up => {
             if app.docker_monitor.ui_state.selected_index > 0 {
                 app.docker_monitor.ui_state.selected_index -= 1;
+                app.docker_monitor.ui_state.selected_id = app.docker_monitor
+                    .containers.get(app.docker_monitor.ui_state.selected_index)
+                    .map(|c| c.id.clone());
                 app.docker_monitor.status_message = None;
                 return Some(InputResult::Consumed);
             }
@@ -255,6 +258,9 @@ fn handle_containers(
             if app.docker_monitor.ui_state.selected_index + 1 < app.docker_monitor.containers.len()
             {
                 app.docker_monitor.ui_state.selected_index += 1;
+                app.docker_monitor.ui_state.selected_id = app.docker_monitor
+                    .containers.get(app.docker_monitor.ui_state.selected_index)
+                    .map(|c| c.id.clone());
                 app.docker_monitor.status_message = None;
                 return Some(InputResult::Consumed);
             }

@@ -37,6 +37,7 @@ pub struct LogViewState {
     pub auto_follow: bool,
     pub search_mode: bool,    // true when typing a search query
     pub search_query: String, // current search text
+    pub truncated_count: u64, // number of lines dropped due to buffer cap
     line_version: u64,
     search_cache: RefCell<Option<LogSearchCache>>,
 }
@@ -51,6 +52,7 @@ impl LogViewState {
             auto_follow: true,
             search_mode: false,
             search_query: String::new(),
+            truncated_count: 0,
             line_version: 0,
             search_cache: RefCell::new(None),
         }
@@ -59,6 +61,7 @@ impl LogViewState {
     pub fn push_line(&mut self, line: String) {
         if self.lines.len() >= 5000 {
             self.lines.pop_front();
+            self.truncated_count += 1;
         }
         self.lines.push_back(line);
         self.line_version += 1;
@@ -108,6 +111,7 @@ pub struct MultiLogViewState {
     pub auto_follow: bool,
     pub search_mode: bool,
     pub search_query: String,
+    pub truncated_count: u64,
     line_version: u64,
     search_cache: RefCell<Option<MultiLogSearchCache>>,
 }
@@ -120,6 +124,7 @@ impl MultiLogViewState {
             auto_follow: true,
             search_mode: false,
             search_query: String::new(),
+            truncated_count: 0,
             line_version: 0,
             search_cache: RefCell::new(None),
         }
@@ -128,6 +133,7 @@ impl MultiLogViewState {
     pub fn push_line(&mut self, line: MultiLogLine) {
         if self.lines.len() >= 20000 {
             self.lines.pop_front();
+            self.truncated_count += 1;
         }
         self.lines.push_back(line);
         self.line_version += 1;
@@ -169,6 +175,7 @@ impl MultiLogViewState {
 
 pub struct ContainerUIState {
     pub selected_index: usize,
+    pub selected_id: Option<String>,
     pub total_rows: usize,
     pub expanded_ids: HashSet<String>,
     pub selected_containers: HashSet<String>,
@@ -178,6 +185,7 @@ impl Default for ContainerUIState {
     fn default() -> Self {
         Self {
             selected_index: 0,
+            selected_id: None,
             total_rows: 0,
             expanded_ids: HashSet::new(),
             selected_containers: HashSet::new(),

@@ -5,6 +5,7 @@ use crate::model::{
 use sysinfo::Pid;
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ pub struct MacCollector {
     /// Cached nettop results, updated by a background thread every ~2 seconds.
     nettop_cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>>,
     command_cache: Mutex<MacCommandCache>,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 struct MacCommandCache {
@@ -25,10 +27,15 @@ impl MacCollector {
     pub fn new() -> Self {
         let cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
         let cache_clone = Arc::clone(&cache);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown_flag);
 
         // Spawn a background thread that continuously runs nettop and updates the cache.
         thread::spawn(move || {
             loop {
+                if shutdown_clone.load(Ordering::Acquire) {
+                    break;
+                }
                 let stats = run_nettop();
                 if let Ok(mut guard) = cache_clone.lock() {
                     *guard = stats;
@@ -44,6 +51,7 @@ impl MacCollector {
                 socket_info: None,
                 context_switches: None,
             }),
+            shutdown_flag,
         }
     }
 
@@ -76,10 +84,14 @@ impl MacCollector {
         let mut info = FdInfo::default();
 
         if let Ok(output) = Command::new("sysctl").arg("kern.num_files").output() {
-            info.system_used = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
+            if output.status.success() {
+                info.system_used = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
+            }
         }
         if let Ok(output) = Command::new("sysctl").arg("kern.maxfiles").output() {
-            info.system_max = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
+            if output.status.success() {
+                info.system_max = Self::parse_sysctl_value(&String::from_utf8_lossy(&output.stdout));
+            }
         }
 
         let cmd = "lsof -n -P | awk '{print $1}' | sort | uniq -c | sort -nr | head -5";
@@ -106,6 +118,9 @@ impl MacCollector {
         let mut fin_wait = 0u32;
 
         if let Ok(output) = Command::new("netstat").args(["-an", "-p", "tcp"]).output() {
+            if !output.status.success() {
+                return SocketOverviewInfo { established, listen, time_wait, close_wait, fin_wait, top_processes: Vec::new() };
+            }
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 if line.contains("ESTABLISHED") { established += 1; }
@@ -141,11 +156,14 @@ impl MacCollector {
         let mut top_processes = Vec::new();
 
         if let Ok(output) = Command::new("ps").args(["-Acro", "comm,nivcsw"]).output() {
+            if !output.status.success() {
+                return ContextSwitchInfo { total_csw, top_processes };
+            }
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines().skip(1) {
                 let parts: Vec<&str> = line.trim().split_whitespace().collect();
                 if parts.len() >= 2 {
-                    if let Ok(csw) = parts.last().unwrap().parse::<u64>() {
+                    if let Ok(csw) = parts.last().unwrap_or(&"0").parse::<u64>() {
                         total_csw += csw;
                         let name_parts = &parts[..parts.len()-1];
                         let name = name_parts.join(" ");
@@ -165,10 +183,19 @@ impl MacCollector {
     }
 }
 
+impl Drop for MacCollector {
+    fn drop(&mut self) {
+        self.shutdown_flag.store(true, Ordering::Release);
+    }
+}
+
 /// Run nettop once and return per-PID network stats.
 fn run_nettop() -> HashMap<Pid, (u64, u64)> {
     let mut stats = HashMap::new();
     if let Ok(output) = Command::new("nettop").args(["-P", "-L", "1"]).output() {
+        if !output.status.success() {
+            return stats;
+        }
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines().skip(1) {
             let parts: Vec<&str> = line.split(',').collect();

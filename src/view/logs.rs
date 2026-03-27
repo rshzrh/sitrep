@@ -29,9 +29,14 @@ pub fn render_logs(log_state: &LogViewState) -> io::Result<()> {
     } else {
         String::new()
     };
+    let truncated_indicator = if log_state.truncated_count > 0 {
+        format!(" | {} lines truncated", log_state.truncated_count)
+    } else {
+        String::new()
+    };
     let header = format!(
-        "  Containers › Logs: {} ({}) - {}{}",
-        log_state.container_name, log_state.container_id, follow_indicator, search_indicator
+        "  Containers › Logs: {} ({}) - {}{}{}",
+        log_state.container_name, log_state.container_id, follow_indicator, search_indicator, truncated_indicator
     );
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
@@ -134,9 +139,14 @@ pub fn render_multi_container_logs(
     } else {
         String::new()
     };
+    let truncated_indicator = if log_state.truncated_count > 0 {
+        format!(" | {} lines truncated", log_state.truncated_count)
+    } else {
+        String::new()
+    };
     let header = format!(
-        "  Containers › Multi-Log: {} containers - {}{}",
-        container_count, follow_indicator, search_indicator
+        "  Containers › Multi-Log: {} containers - {}{}{}",
+        container_count, follow_indicator, search_indicator, truncated_indicator
     );
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;
@@ -245,13 +255,19 @@ pub fn render_service_logs(log_state: &ServiceLogState) -> io::Result<()> {
     } else {
         String::new()
     };
+    let truncated_indicator = if log_state.truncated_count > 0 {
+        format!(" | {} lines truncated", log_state.truncated_count)
+    } else {
+        String::new()
+    };
     let header = format!(
-        "  Swarm › Service Logs: {} ({}) - {}{}{}",
+        "  Swarm › Service Logs: {} ({}) - {}{}{}{}",
         log_state.service_name,
         log_state.service_id,
         follow_indicator,
         filter_indicator,
-        search_indicator
+        search_indicator,
+        truncated_indicator
     );
 
     queue!(io::stdout(), SetAttribute(Attribute::Bold))?;

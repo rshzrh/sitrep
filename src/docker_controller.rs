@@ -10,6 +10,13 @@ use crate::model::{
 /// Receiver for background Docker action results.
 type ActionReceiver = std::sync::mpsc::Receiver<Result<String, String>>;
 
+/// Result of a background Docker update.
+struct DockerUpdateResult {
+    containers: Vec<DockerContainerInfo>,
+    cpu_cache: HashMap<String, f64>,
+    cpu_refresh_cursor: usize,
+}
+
 /// Manages Docker container data collection and log streaming.
 pub struct DockerMonitor {
     client: Option<DockerClient>,
@@ -26,21 +33,25 @@ pub struct DockerMonitor {
     pub status_message: Option<String>,
     action_receiver: Option<ActionReceiver>,
     pub action_in_progress: bool,
+    update_receiver: Option<std::sync::mpsc::Receiver<Result<DockerUpdateResult, String>>>,
 }
 
 impl DockerMonitor {
-    pub fn new(rt: Arc<tokio::runtime::Runtime>) -> Self {
-        let client = DockerClient::try_new();
-
-        // Verify daemon is actually reachable
-        let docker_available = if let Some(ref c) = client {
-            rt.block_on(c.is_available())
+    pub fn new(rt: Arc<tokio::runtime::Runtime>, no_docker: bool) -> Self {
+        let (client, docker_available) = if no_docker {
+            (None, false)
         } else {
-            false
+            let client = DockerClient::try_new();
+            let available = if let Some(ref c) = client {
+                rt.block_on(c.is_available())
+            } else {
+                false
+            };
+            (if available { client } else { None }, available)
         };
 
         Self {
-            client: if docker_available { client } else { None },
+            client,
             containers: Vec::new(),
             cpu_cache: HashMap::new(),
             cpu_refresh_cursor: 0,
@@ -54,66 +65,138 @@ impl DockerMonitor {
             status_message: None,
             action_receiver: None,
             action_in_progress: false,
+            update_receiver: None,
         }
     }
 
-    /// Refresh container list and stats. Called on the 3-second tick.
+    /// Spawn a background update for container list and stats. Called on the 3-second tick.
     pub fn update(&mut self) {
-        let Some(ref client) = self.client else { return };
+        if self.client.is_none() {
+            return;
+        }
+        if self.update_receiver.is_some() {
+            return; // update already in flight
+        }
 
-        match self.rt.block_on(client.list_containers()) {
-            Ok(mut containers) => {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.update_receiver = Some(rx);
+
+        let rt = Arc::clone(&self.rt);
+        let cpu_cache = self.cpu_cache.clone();
+        let cpu_refresh_cursor = self.cpu_refresh_cursor;
+
+        std::thread::spawn(move || {
+            let result = rt.block_on(async {
+                let client = match crate::docker::DockerClient::try_new() {
+                    Some(c) => c,
+                    None => return Err("Failed to connect to Docker".to_string()),
+                };
+
+                let mut containers = client.list_containers().await?;
                 let ids: Vec<String> = containers.iter().map(|c| c.id.clone()).collect();
 
-                // Reuse recent CPU values for the full list, then refresh a
-                // small rotating subset to avoid one stats call per container
-                // on every tick.
+                let mut new_cpu_cache = cpu_cache;
+
+                // Reuse recent CPU values for the full list
                 for c in &mut containers {
-                    c.cpu_percent = *self.cpu_cache.get(&c.id).unwrap_or(&0.0);
+                    c.cpu_percent = *new_cpu_cache.get(&c.id).unwrap_or(&0.0);
                 }
 
                 const CPU_REFRESH_BATCH_SIZE: usize = 4;
+                let new_cursor;
                 if !ids.is_empty() {
-                    let start = self.cpu_refresh_cursor.min(ids.len());
-                    let end = (start + CPU_REFRESH_BATCH_SIZE).min(ids.len());
-                    let refresh_ids = if start < end {
-                        &ids[start..end]
-                    } else {
-                        &ids[..ids.len().min(CPU_REFRESH_BATCH_SIZE)]
-                    };
+                    // Prioritize containers not yet in cache (new containers)
+                    let mut refresh_ids: Vec<String> = ids.iter()
+                        .filter(|id| !new_cpu_cache.contains_key(id.as_str()))
+                        .take(CPU_REFRESH_BATCH_SIZE)
+                        .cloned()
+                        .collect();
 
-                    let refresh_ids_vec: Vec<String> = refresh_ids.to_vec();
-                    let cpu_percents = self.rt.block_on(client.get_all_cpu_percents(&refresh_ids_vec));
-                    for (id, cpu) in refresh_ids.iter().zip(cpu_percents.into_iter()) {
-                        self.cpu_cache.insert(id.clone(), cpu);
+                    // Fill remaining slots with rotating cursor
+                    let remaining = CPU_REFRESH_BATCH_SIZE.saturating_sub(refresh_ids.len());
+                    if remaining > 0 {
+                        let start = cpu_refresh_cursor.min(ids.len());
+                        let end = (start + remaining).min(ids.len());
+                        for id in &ids[start..end] {
+                            if !refresh_ids.contains(id) {
+                                refresh_ids.push(id.clone());
+                            }
+                        }
+                        new_cursor = if end >= ids.len() { 0 } else { end };
+                    } else {
+                        // All slots used by new containers, don't advance cursor
+                        new_cursor = cpu_refresh_cursor;
                     }
 
-                    self.cpu_refresh_cursor = if end >= ids.len() {
-                        0
-                    } else {
-                        end
-                    };
+                    if !refresh_ids.is_empty() {
+                        let cpu_percents = client.get_all_cpu_percents(&refresh_ids).await;
+                        for (id, cpu) in refresh_ids.iter().zip(cpu_percents.into_iter()) {
+                            new_cpu_cache.insert(id.clone(), cpu);
+                        }
+                    }
                 } else {
-                    self.cpu_refresh_cursor = 0;
+                    new_cursor = 0;
                 }
 
-                self.cpu_cache.retain(|id, _| ids.contains(id));
+                new_cpu_cache.retain(|id, _| ids.contains(id));
                 for c in &mut containers {
-                    c.cpu_percent = *self.cpu_cache.get(&c.id).unwrap_or(&c.cpu_percent);
+                    c.cpu_percent = *new_cpu_cache.get(&c.id).unwrap_or(&c.cpu_percent);
                 }
 
-                self.containers = containers;
-            }
-            Err(e) => {
-                self.status_message = Some(format!("Error: {}", e));
-            }
-        }
+                Ok(DockerUpdateResult {
+                    containers,
+                    cpu_cache: new_cpu_cache,
+                    cpu_refresh_cursor: new_cursor,
+                })
+            });
+            let _ = tx.send(result);
+        });
+    }
 
-        // Clamp selected index
-        let total = self.containers.len();
-        self.ui_state.total_rows = total;
-        if self.ui_state.selected_index >= total && total > 0 {
-            self.ui_state.selected_index = total - 1;
+    /// Poll for background update completion. Returns true if data changed.
+    pub fn poll_update(&mut self) -> bool {
+        let Some(ref rx) = self.update_receiver else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.containers = result.containers;
+                self.cpu_cache = result.cpu_cache;
+                self.cpu_refresh_cursor = result.cpu_refresh_cursor;
+                self.update_receiver = None;
+
+                // Restore selection by container ID, or clamp
+                let total = self.containers.len();
+                self.ui_state.total_rows = total;
+                if let Some(ref prev_id) = self.ui_state.selected_id {
+                    if let Some(pos) = self.containers.iter().position(|c| &c.id == prev_id) {
+                        self.ui_state.selected_index = pos;
+                    } else if self.ui_state.selected_index >= total && total > 0 {
+                        self.ui_state.selected_index = total - 1;
+                    }
+                } else if self.ui_state.selected_index >= total && total > 0 {
+                    self.ui_state.selected_index = total - 1;
+                }
+                // Update tracked ID
+                self.ui_state.selected_id = self.containers
+                    .get(self.ui_state.selected_index)
+                    .map(|c| c.id.clone());
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Docker update failed: {}", e);
+                self.containers.clear();
+                self.cpu_cache.clear();
+                self.cpu_refresh_cursor = 0;
+                self.status_message = Some(format!("Error: {}", e));
+                self.update_receiver = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.update_receiver = None;
+                false
+            }
         }
     }
 
@@ -309,6 +392,7 @@ impl DockerMonitor {
                 true
             }
             Ok(Err(msg)) => {
+                tracing::error!("Container action failed: {}", msg);
                 self.status_message = Some(format!("Error: {}", msg));
                 self.action_in_progress = false;
                 self.action_receiver = None;

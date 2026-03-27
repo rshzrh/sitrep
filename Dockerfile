@@ -1,16 +1,25 @@
-FROM rust:latest
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /usr/src/sitrep
 
-# Copy manifest and source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# Build release binary
 RUN cargo build --release
 
-# Set terminal environment for crossterm
-ENV TERM=xterm-256color
+FROM debian:bookworm-slim
 
-# Run the binary
-CMD ["./target/release/sitrep"]
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/bash sitrep
+USER sitrep
+
+COPY --from=builder /usr/src/sitrep/target/release/sitrep /usr/local/bin/sitrep
+
+ENV TERM=xterm-256color
+ENV RUST_BACKTRACE=1
+
+CMD ["sitrep"]

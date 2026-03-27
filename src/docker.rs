@@ -6,6 +6,7 @@ use bollard::container::{
 use bollard::models::ContainerSummary;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::model::DockerContainerInfo;
@@ -61,10 +62,9 @@ impl DockerClient {
         };
 
         let mut stream = self.client.stats(container_id, Some(options));
-        if let Some(Ok(stats)) = stream.next().await {
-            calculate_cpu_percent(&stats)
-        } else {
-            0.0
+        match tokio::time::timeout(Duration::from_secs(3), stream.next()).await {
+            Ok(Some(Ok(stats))) => calculate_cpu_percent(&stats),
+            _ => 0.0,
         }
     }
 

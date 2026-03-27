@@ -145,6 +145,7 @@ pub struct ServiceLogState {
     pub filter_errors: bool,
     pub search_mode: bool,
     pub search_query: String,
+    pub truncated_count: u64,
     line_version: u64,
     filter_cache: RefCell<Option<ServiceLogFilterCache>>,
 }
@@ -160,6 +161,7 @@ impl ServiceLogState {
             filter_errors: false,
             search_mode: false,
             search_query: String::new(),
+            truncated_count: 0,
             line_version: 0,
             filter_cache: RefCell::new(None),
         }
@@ -168,6 +170,7 @@ impl ServiceLogState {
     pub fn push_line(&mut self, line: String) {
         if self.lines.len() >= 10000 {
             self.lines.pop_front();
+            self.truncated_count += 1;
         }
         self.lines.push_back(line);
         self.line_version += 1;

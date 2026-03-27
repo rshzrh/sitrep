@@ -130,6 +130,7 @@ impl SwarmMonitor {
                 self.nodes = nodes;
             }
             Err(e) => {
+                tracing::warn!("Swarm node list failed: {}", e);
                 self.status_message = Some(format!("Error: {}", e));
             }
         }
@@ -140,6 +141,7 @@ impl SwarmMonitor {
                 self.build_stacks();
             }
             Err(e) => {
+                tracing::warn!("Swarm service list failed: {}", e);
                 self.status_message = Some(format!("Error: {}", e));
             }
         }
@@ -149,6 +151,7 @@ impl SwarmMonitor {
             match swarm::list_service_tasks(svc_id) {
                 Ok(tasks) => self.tasks = tasks,
                 Err(e) => {
+                    tracing::warn!("Swarm task list failed: {}", e);
                     self.status_message = Some(format!("Error: {}", e));
                 }
             }
@@ -196,6 +199,7 @@ impl SwarmMonitor {
                         }
                     }
                     Err(e) => {
+                        tracing::warn!("Swarm task fetch failed: {}", e);
                         self.status_message = Some(format!("Task fetch error: {}", e));
                     }
                 }
@@ -438,6 +442,7 @@ impl SwarmMonitor {
                 true
             }
             Ok(Err(msg)) => {
+                tracing::error!("Swarm action failed: {}", msg);
                 self.status_message = Some(msg);
                 self.action_in_progress = false;
                 self.action_receiver = None;
