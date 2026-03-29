@@ -47,9 +47,15 @@ pub struct App {
 impl App {
     pub fn new(rt: Arc<tokio::runtime::Runtime>, tick_rate_secs: u64, no_docker: bool) -> Self {
         let tick_rate = Duration::from_secs(tick_rate_secs);
-        let monitor = Monitor::new();
-        let docker_monitor = DockerMonitor::new(Arc::clone(&rt), no_docker);
-        let swarm_monitor = SwarmMonitor::new();
+
+        let monitor_handle = std::thread::spawn(Monitor::new);
+        let swarm_handle = std::thread::spawn(SwarmMonitor::new);
+        let rt_clone = Arc::clone(&rt);
+        let docker_handle = std::thread::spawn(move || DockerMonitor::new(rt_clone, no_docker));
+
+        let monitor = monitor_handle.join().expect("Monitor init panicked");
+        let docker_monitor = docker_handle.join().expect("DockerMonitor init panicked");
+        let swarm_monitor = swarm_handle.join().expect("SwarmMonitor init panicked");
         let app_view = AppView::System;
 
         tracing::info!(
@@ -88,6 +94,8 @@ pub fn run(should_quit: Arc<AtomicBool>, cli: &crate::cli::Cli) -> io::Result<()
             .build()
             .expect("Failed to create tokio runtime"),
     );
+
+    Presenter::render_splash()?;
 
     let mut app = App::new(Arc::clone(&rt), cli.refresh_rate, cli.no_docker);
     let mut needs_render = true;

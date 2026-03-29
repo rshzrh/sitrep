@@ -228,7 +228,7 @@ pub fn render(
 
     // ── Process table header ──
     let headers: &[(&str, usize, Option<SortColumn>)] = &[
-        ("PID", 7, None),
+        ("PID", 9, None),
         ("USER", 10, None),
         ("CPU%", 6, Some(SortColumn::Cpu)),
         ("MEM", 6, Some(SortColumn::Memory)),
@@ -296,7 +296,7 @@ pub fn render(
 
         // PID
         queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
-        write!(out, "  {:<7}", g.pid)?;
+        write!(out, "  {:<9}", g.pid)?;
 
         // USER
         let user_display = if g.user.len() > 9 {
@@ -362,7 +362,7 @@ pub fn render(
 
                 // Indented PID
                 queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
-                write!(out, "      {:<5}", child.pid)?;
+                write!(out, "      {:<5}  ", child.pid)?;
 
                 // USER
                 let child_user = if child.user.len() > 9 {

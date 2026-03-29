@@ -4,6 +4,7 @@ mod logs;
 mod shared;
 mod swarm;
 mod system;
+mod splash;
 mod tab_bar;
 pub mod theme;
 
@@ -144,5 +145,9 @@ impl Presenter {
 
     pub fn render_confirmation(prompt: &str) -> io::Result<()> {
         confirmation::render_confirmation(prompt)
+    }
+
+    pub fn render_splash() -> io::Result<()> {
+        splash::render_splash()
     }
 }
