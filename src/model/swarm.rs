@@ -119,6 +119,7 @@ pub enum SwarmViewLevel {
 }
 
 /// UI state for the Swarm tab
+#[derive(Clone)]
 pub struct SwarmUIState {
     pub view_level: SwarmViewLevel,
     pub selected_index: usize,

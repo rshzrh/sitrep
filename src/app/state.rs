@@ -10,10 +10,16 @@ pub struct PendingAction {
 }
 
 pub enum PendingActionKind {
+    // Local Docker actions (dispatched to DockerMonitor)
     ContainerStart(String),
     ContainerStop(String),
     ContainerRestart(String),
     SwarmRollingRestart(String),
+    // Remote Docker actions (dispatched to RemoteHost via SSH)
+    RemoteContainerStart { host_idx: usize, id: String, name: String },
+    RemoteContainerStop { host_idx: usize, id: String, name: String },
+    RemoteContainerRestart { host_idx: usize, id: String, name: String },
+    RemoteRollingRestart { host_idx: usize, id: String, name: String },
 }
 
 /// What kind of item is at a given row index in the Swarm overview.

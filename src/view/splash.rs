@@ -15,7 +15,7 @@ pub fn render_splash() -> io::Result<()> {
 
     execute!(out, terminal::Clear(terminal::ClearType::All))?;
 
-    let name = "sitrep";
+    let name = "flotop";
     let tagline = "Initializing...";
 
     let center_y = rows / 2;

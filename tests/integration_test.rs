@@ -1,12 +1,12 @@
 //! Integration tests for the refactored model and view modules.
 //! Verifies that the split modules work together correctly.
 
-use sitrep::model::{
+use flotop::model::{
     AppView, MonitorData, UIState, MemoryInfo, NetworkInfo,
     FdInfo, ContextSwitchInfo, SocketOverviewInfo,
     ContainerUIState, LogViewState, SwarmUIState, ServiceLogState,
 };
-use sitrep::view::{Presenter, truncate_str, safe_truncate};
+use flotop::view::{Presenter, truncate_str, safe_truncate};
 
 #[test]
 fn model_types_construct() {

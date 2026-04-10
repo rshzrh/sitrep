@@ -21,6 +21,7 @@ impl fmt::Display for SectionId {
     }
 }
 
+#[derive(Clone)]
 pub struct SectionLayout {
     pub id: SectionId,
     pub title: String,
@@ -42,8 +43,15 @@ impl SectionLayout {
     }
 }
 
+#[derive(Clone)]
 pub struct Layout {
     pub sections: Vec<SectionLayout>,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self::default_layout()
+    }
 }
 
 impl Layout {

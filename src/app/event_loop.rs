@@ -28,6 +28,11 @@ impl App {
                     self.swarm_monitor.update();
                 }
             }
+            AppView::FleetOverview | AppView::Remote { .. } => {
+                // Fleet refreshes are driven by per-host tokio tasks via mpsc;
+                // poll_fleet() / poll_remote_* drain those updates each tick.
+                // The actual SSH I/O happens in the background tasks.
+            }
         }
 
         if !self.swarm_monitor.is_swarm() && self.tick_counter % 10 == 0 {
@@ -135,6 +140,9 @@ impl App {
                         if self.swarm_monitor.is_swarm() {
                             self.swarm_monitor.update();
                         }
+                    }
+                    AppView::FleetOverview | AppView::Remote { .. } => {
+                        // No-op: fleet refreshes are pushed by per-host tasks.
                     }
                 }
                 self.last_tab_refresh = now;

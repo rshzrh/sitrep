@@ -1,4 +1,8 @@
 use super::SystemCollector;
+use super::parsers::{
+    parse_diskstats, parse_file_nr, parse_net_dev, parse_proc_stat_ctxt,
+    parse_proc_status_ctxt, parse_tcp_table,
+};
 use crate::model::{ContextSwitchInfo, FdInfo, SocketOverviewInfo};
 use sysinfo::Pid;
 use std::cell::RefCell;
@@ -42,63 +46,22 @@ impl LinuxCollector {
         }
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────
+    // ── thin I/O wrappers around pure parsers ───────────────────────────
+    //
+    // These read /proc files from disk and delegate parsing to
+    // `super::parsers`. Same parsers are used by RemoteLinuxCollector to
+    // parse SSH-fetched output, so they only exist in one place.
 
-    /// Read /proc/diskstats and return device_name → io_ticks (ms) for real
-    /// block devices only (partitions are excluded).
     fn read_diskstats() -> HashMap<String, u64> {
-        let mut result = HashMap::new();
-        let content = match fs::read_to_string("/proc/diskstats") {
-            Ok(c) => c,
-            Err(_) => return result,
-        };
-        for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            // Fields (0-indexed):
-            //  0  major
-            //  1  minor
-            //  2  name
-            //  3  reads completed
-            //  …
-            // 12  io_ticks (ms spent doing I/Os)
-            if parts.len() >= 13 {
-                let name = parts[2];
-                if is_block_device(name) {
-                    if let Ok(ticks) = parts[12].parse::<u64>() {
-                        result.insert(name.to_string(), ticks);
-                    }
-                }
-            }
-        }
-        result
+        fs::read_to_string("/proc/diskstats")
+            .map(|c| parse_diskstats(&c))
+            .unwrap_or_default()
     }
 
-    /// Read /proc/net/dev and return interface → (rx_bytes, tx_bytes),
-    /// excluding the loopback adapter.
     fn read_net_dev() -> HashMap<String, (u64, u64)> {
-        let mut result = HashMap::new();
-        let content = match fs::read_to_string("/proc/net/dev") {
-            Ok(c) => c,
-            Err(_) => return result,
-        };
-        // First two lines are headers.
-        for line in content.lines().skip(2) {
-            let line = line.trim();
-            if let Some((iface, rest)) = line.split_once(':') {
-                let iface = iface.trim();
-                if iface == "lo" {
-                    continue;
-                }
-                let cols: Vec<&str> = rest.split_whitespace().collect();
-                // rx_bytes is col 0, tx_bytes is col 8.
-                if cols.len() >= 10 {
-                    let rx = cols[0].parse::<u64>().unwrap_or(0);
-                    let tx = cols[8].parse::<u64>().unwrap_or(0);
-                    result.insert(iface.to_string(), (rx, tx));
-                }
-            }
-        }
-        result
+        fs::read_to_string("/proc/net/dev")
+            .map(|c| parse_net_dev(&c))
+            .unwrap_or_default()
     }
 
     /// Scan /proc/[pid]/fd/ to build a mapping of socket inode → (pid, comm).
@@ -147,23 +110,12 @@ impl LinuxCollector {
         map
     }
 
-    /// Parse /proc/net/tcp and /proc/net/tcp6.
-    /// Returns Vec<(inode, tcp_state)>.
+    /// Read /proc/net/tcp and /proc/net/tcp6, parse via the shared parser.
     fn read_tcp_entries() -> Vec<(u64, u8)> {
         let mut entries = Vec::new();
         for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
             if let Ok(content) = fs::read_to_string(path) {
-                for line in content.lines().skip(1) {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    // col 3 = state (hex), col 9 = inode
-                    if parts.len() >= 10 {
-                        let state = u8::from_str_radix(parts[3], 16).unwrap_or(0);
-                        let inode = parts[9].parse::<u64>().unwrap_or(0);
-                        if inode > 0 {
-                            entries.push((inode, state));
-                        }
-                    }
-                }
+                entries.extend(parse_tcp_table(&content));
             }
         }
         entries
@@ -192,43 +144,8 @@ impl LinuxCollector {
     }
 }
 
-// ── block-device detection ──────────────────────────────────────────────
-
-/// Return `true` if `name` looks like a whole block device rather than a
-/// partition.  Uses /sys/block/<name> when available, otherwise falls back
-/// to name-pattern heuristics.
-fn is_block_device(name: &str) -> bool {
-    // Fast path: the kernel exposes every real block device here.
-    if Path::new(&format!("/sys/block/{}", name)).exists() {
-        return true;
-    }
-    // Fallback heuristics when /sys is unavailable (e.g. some containers).
-    // sda, sdb  (SCSI/SATA — not sda1)
-    if name.starts_with("sd") && name.len() == 3 && name.as_bytes()[2].is_ascii_alphabetic() {
-        return true;
-    }
-    // nvme0n1 (NVMe — not nvme0n1p1)
-    if name.starts_with("nvme") && name.contains('n') && !name.contains('p') {
-        return true;
-    }
-    // vda, vdb (virtio — not vda1)
-    if name.starts_with("vd") && name.len() == 3 && name.as_bytes()[2].is_ascii_alphabetic() {
-        return true;
-    }
-    // xvda (Xen — not xvda1)
-    if name.starts_with("xvd") && name.len() == 4 && name.as_bytes()[3].is_ascii_alphabetic() {
-        return true;
-    }
-    // mmcblk0 (SD cards — not mmcblk0p1)
-    if name.starts_with("mmcblk") && !name.contains('p') {
-        return true;
-    }
-    // dm-0, dm-1 (device-mapper / LVM)
-    if name.starts_with("dm-") {
-        return true;
-    }
-    false
-}
+// (`is_block_device` lives in `super::parsers` so it can be used by both
+// the local file reader and the SSH-fetched-output parser.)
 
 // ── trait implementation ────────────────────────────────────────────────
 
@@ -279,14 +196,10 @@ impl SystemCollector for LinuxCollector {
         let mut info = FdInfo::default();
 
         // ── system-wide ──
-        // /proc/sys/fs/file-nr: "allocated  free  max"
         if let Ok(content) = fs::read_to_string("/proc/sys/fs/file-nr") {
-            let parts: Vec<&str> = content.split_whitespace().collect();
-            if parts.len() >= 3 {
-                let allocated: u64 = parts[0].parse().unwrap_or(0);
-                let free: u64 = parts[1].parse().unwrap_or(0);
-                info.system_used = allocated.saturating_sub(free);
-                info.system_max = parts[2].parse().unwrap_or(0);
+            if let Some((used, max)) = parse_file_nr(&content) {
+                info.system_used = used;
+                info.system_max = max;
             }
         }
 
@@ -373,12 +286,7 @@ impl SystemCollector for LinuxCollector {
 
         // ── system-wide total (lifetime since boot) ──
         if let Ok(stat) = fs::read_to_string("/proc/stat") {
-            for line in stat.lines() {
-                if let Some(rest) = line.strip_prefix("ctxt ") {
-                    info.total_csw = rest.trim().parse().unwrap_or(0);
-                    break;
-                }
-            }
+            info.total_csw = parse_proc_stat_ctxt(&stat).unwrap_or(0);
         }
 
         // ── per-process ──
@@ -398,22 +306,14 @@ impl SystemCollector for LinuxCollector {
                 }
 
                 if let Ok(status) = fs::read_to_string(path.join("status")) {
-                    let mut name = fname.clone();
-                    let mut vol: u64 = 0;
-                    let mut nonvol: u64 = 0;
-
-                    for line in status.lines() {
-                        if let Some(rest) = line.strip_prefix("Name:") {
-                            name = rest.trim().to_string();
-                        } else if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
-                            vol = rest.trim().parse().unwrap_or(0);
-                        } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:")
-                        {
-                            nonvol = rest.trim().parse().unwrap_or(0);
-                        }
-                    }
-                    let total = vol + nonvol;
+                    let parsed = parse_proc_status_ctxt(&status);
+                    let total = parsed.total();
                     if total > 0 {
+                        let name = if parsed.name.is_empty() {
+                            fname
+                        } else {
+                            parsed.name
+                        };
                         counts.push((name, total));
                     }
                 }

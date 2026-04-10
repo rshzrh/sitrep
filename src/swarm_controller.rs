@@ -213,98 +213,24 @@ impl SwarmMonitor {
     /// Build stack groupings from services.
     /// Uses indices into self.services to avoid cloning service data.
     fn build_stacks(&mut self) {
-        use std::collections::HashMap;
-        let mut stack_map: HashMap<String, Vec<usize>> = HashMap::new();
-
-        for (i, svc) in self.services.iter().enumerate() {
-            let stack_name = if svc.stack.is_empty() {
-                "(no stack)".to_string()
-            } else {
-                svc.stack.clone()
-            };
-            stack_map.entry(stack_name).or_default().push(i);
-        }
-
-        let mut stacks: Vec<SwarmStackInfo> = stack_map
-            .into_iter()
-            .map(|(name, indices)| SwarmStackInfo { name, service_indices: indices })
-            .collect();
-
-        // Sort: named stacks first, then "(no stack)" last
-        stacks.sort_by(|a, b| {
-            if a.name == "(no stack)" {
-                std::cmp::Ordering::Greater
-            } else if b.name == "(no stack)" {
-                std::cmp::Ordering::Less
-            } else {
-                a.name.cmp(&b.name)
-            }
-        });
-
-        self.stacks = stacks;
+        self.stacks = crate::swarm_helpers::build_stacks(&self.services);
     }
 
-    /// Generate smart warnings about cluster health.
+    /// Generate smart warnings about cluster health. Delegates the pure
+    /// computation to `swarm_helpers` so both the local and remote paths
+    /// get the same warnings.
     fn generate_warnings(&mut self) {
         self.warnings.clear();
-
         if !self.docker_cli_available {
-            self.warnings.push("docker CLI not found in PATH — Swarm data unavailable".to_string());
+            self.warnings
+                .push("docker CLI not found in PATH — Swarm data unavailable".to_string());
             return;
         }
-
-        // Check for down nodes
-        let down_nodes: Vec<&str> = self.nodes.iter()
-            .filter(|n| n.status.to_lowercase().contains("down"))
-            .map(|n| n.hostname.as_str())
-            .collect();
-        if !down_nodes.is_empty() {
-            self.warnings.push(format!(
-                "NODE DOWN: {} node(s) unreachable: {}",
-                down_nodes.len(),
-                down_nodes.join(", ")
-            ));
-        }
-
-        // Check for drained nodes
-        let drain_nodes: Vec<&str> = self.nodes.iter()
-            .filter(|n| n.availability.to_lowercase().contains("drain"))
-            .map(|n| n.hostname.as_str())
-            .collect();
-        if !drain_nodes.is_empty() {
-            self.warnings.push(format!(
-                "DRAINED: {} node(s) in drain mode: {}",
-                drain_nodes.len(),
-                drain_nodes.join(", ")
-            ));
-        }
-
-        // Check for services with incomplete replicas
-        for svc in &self.services {
-            if svc.replicas.contains('/') {
-                let parts: Vec<&str> = svc.replicas.split('/').collect();
-                if parts.len() == 2 {
-                    let current: u32 = parts[0].trim().parse().unwrap_or(0);
-                    let desired: u32 = parts[1].trim().parse().unwrap_or(0);
-                    if desired > 0 && current < desired {
-                        self.warnings.push(format!(
-                            "SERVICE DEGRADED: {} has {}/{} replicas",
-                            svc.name, current, desired
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Check manager count
-        if let Some(ref info) = self.cluster_info {
-            if info.managers < 3 && info.nodes_total > 3 {
-                self.warnings.push(format!(
-                    "LOW MANAGERS: Only {} manager(s) for {} nodes (recommend 3+)",
-                    info.managers, info.nodes_total
-                ));
-            }
-        }
+        self.warnings = crate::swarm_helpers::compute_warnings(
+            &self.nodes,
+            &self.services,
+            self.cluster_info.as_ref(),
+        );
     }
 
     /// Get the total number of selectable rows in the current overview.

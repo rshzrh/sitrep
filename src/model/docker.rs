@@ -173,6 +173,7 @@ impl MultiLogViewState {
 
 // --- Container UI state ---
 
+#[derive(Clone)]
 pub struct ContainerUIState {
     pub selected_index: usize,
     pub selected_id: Option<String>,

@@ -1,0 +1,154 @@
+name: Release
+
+# Trigger: any tag matching v*  (e.g. v0.1.0, v0.0.1-test)
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            # russh -> ring chain has historically had cross-compile pain on aarch64-linux.
+            # `cross` (rust-cross/cross) handles this with a docker image that has the
+            # right toolchain pre-installed. Verified working as of 2026.
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build with cross
+        if: matrix.cross
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+          cross build --release --target "$TARGET"
+
+      - name: Build with cargo
+        if: ${{ !matrix.cross }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --target "$TARGET"
+
+      - name: Package archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          BIN_NAME=flotop
+          ARCHIVE_NAME="${BIN_NAME}-${REF_NAME}-${TARGET}"
+          mkdir -p "dist/${ARCHIVE_NAME}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "dist/${ARCHIVE_NAME}/"
+          cp README.md LICENSE "dist/${ARCHIVE_NAME}/" 2>/dev/null || true
+          cd dist
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          echo "ARCHIVE_PATH=dist/${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+          echo "ARCHIVE_SHA=dist/${ARCHIVE_NAME}.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.ARCHIVE_SHA }}
+
+  install-script:
+    name: Generate install.sh
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate install.sh
+        run: |
+          cat > install.sh <<'INSTALL_EOF'
+          #!/usr/bin/env bash
+          # flotop installer — fetches the right prebuilt binary for your platform.
+          set -euo pipefail
+
+          REPO="rshzrh/flotop"
+          BIN="flotop"
+          INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+          OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          ARCH="$(uname -m)"
+
+          case "$OS-$ARCH" in
+            linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
+            linux-aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
+            linux-arm64)    TARGET="aarch64-unknown-linux-gnu" ;;
+            darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
+            darwin-arm64)   TARGET="aarch64-apple-darwin" ;;
+            *) echo "Unsupported platform: $OS-$ARCH" >&2; exit 1 ;;
+          esac
+
+          VERSION="${VERSION:-$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -oE '"tag_name":\s*"[^"]+"' | cut -d'"' -f4)}"
+          if [ -z "$VERSION" ]; then
+            echo "Could not determine latest version. Set VERSION=v0.x.y manually." >&2
+            exit 1
+          fi
+
+          ARCHIVE="${BIN}-${VERSION}-${TARGET}.tar.gz"
+          URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
+
+          echo "Downloading ${ARCHIVE}..."
+          mkdir -p "$INSTALL_DIR"
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          curl -fsSL "$URL" | tar xz -C "$tmpdir"
+          mv "$tmpdir/${BIN}-${VERSION}-${TARGET}/${BIN}" "$INSTALL_DIR/${BIN}"
+          chmod +x "$INSTALL_DIR/${BIN}"
+
+          echo ""
+          echo "flotop installed to ${INSTALL_DIR}/${BIN}"
+          if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+            echo "Add to PATH:  export PATH=\"$INSTALL_DIR:\$PATH\""
+          fi
+          echo "Run:          ${BIN} --help"
+          INSTALL_EOF
+          chmod +x install.sh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: install.sh

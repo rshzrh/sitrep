@@ -294,9 +294,14 @@ pub fn render(
             queue!(out, SetBackgroundColor(t.selected_bg))?;
         }
 
-        // PID
+        // PID — pre-format to String because `sysinfo::Pid`'s Display impl
+        // forwards to the inner type via `write!(f, "{}", inner)` which
+        // creates a fresh formatter that discards the `{:<9}` width flag.
+        // Without this indirection, 7-digit remote PIDs render with zero
+        // padding and run straight into the USER column.
         queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
-        write!(out, "  {:<9}", g.pid)?;
+        let pid_str = format!("{}", g.pid);
+        write!(out, "  {:<9}", pid_str)?;
 
         // USER
         let user_display = if g.user.len() > 9 {
@@ -360,9 +365,10 @@ pub fn render(
                     queue!(out, SetBackgroundColor(t.selected_bg))?;
                 }
 
-                // Indented PID
+                // Indented PID (pre-format for the same reason as parent PID)
                 queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
-                write!(out, "      {:<5}  ", child.pid)?;
+                let child_pid_str = format!("{}", child.pid);
+                write!(out, "      {:<5}  ", child_pid_str)?;
 
                 // USER
                 let child_user = if child.user.len() > 9 {
