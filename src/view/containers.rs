@@ -16,6 +16,13 @@ fn cpu_bar(percent: f64) -> String {
     format!("[{}{}]", "|".repeat(filled), " ".repeat(empty))
 }
 
+/// Fixed column widths for everything EXCEPT NAME. NAME gets the remainder
+/// of the terminal width so full swarm task container names
+/// (`service.node_id.task_id`, 60+ chars) are visible.
+const FIXED_COLS_WIDTH: usize = 2 /* lead  */ + 4 /* ## */ + 15 /* ID */
+    + 11 /* STATE */ + 9 /* UPTIME */ + 16 /* CPU */ + 28 /* PORTS */
+    + 17 /* IP min */;
+
 pub fn render_containers(
     containers: &[DockerContainerInfo],
     ui_state: &ContainerUIState,
@@ -25,6 +32,11 @@ pub fn render_containers(
     let mut out = stdout();
     let (width, _height) = crossterm::terminal::size()?;
     let w = width as usize;
+
+    // Dynamic NAME column width: fills the gap left by the fixed columns.
+    // Minimum 20 so a tiny terminal still shows something useful; scales
+    // up to ~80 chars on a wide terminal to fit full swarm task names.
+    let name_width = w.saturating_sub(FIXED_COLS_WIDTH).max(20);
 
     queue!(out, cursor::MoveTo(0, 2))?;
 
@@ -39,10 +51,12 @@ pub fn render_containers(
         )?;
         queue!(out, ResetColor)?;
     } else {
-        // Column header
+        // Column header — NAME width is dynamic so wide terminals show
+        // full swarm task container names.
         let header = format!(
-            "  {:<4}{:<15}{:<20}{:<11}{:<9}{:<16}{:<28}{}",
-            "##", "CONTAINER ID", "NAME", "STATE", "UPTIME", "CPU", "PORTS", "IP"
+            "  {:<4}{:<15}{:<name_width$}{:<11}{:<9}{:<16}{:<28}{}",
+            "##", "CONTAINER ID", "NAME", "STATE", "UPTIME", "CPU", "PORTS", "IP",
+            name_width = name_width
         );
         queue!(
             out,
@@ -59,7 +73,9 @@ pub fn render_containers(
             // Multi-select marker
             let marker = if is_multi_selected { "[*]" } else { "[ ]" };
 
-            let name_trunc = safe_truncate(&c.name, 18);
+            // Truncate NAME to the dynamic width minus a 2-char right
+            // margin so it doesn't touch the STATE column.
+            let name_trunc = safe_truncate(&c.name, name_width.saturating_sub(2));
             let ports_trunc = safe_truncate(&c.ports, 26);
             let bar = cpu_bar(c.cpu_percent);
             let cpu_str = format!("{} {:>5.1}%", bar, c.cpu_percent);
@@ -104,8 +120,8 @@ pub fn render_containers(
             }
             write!(out, "{:<15}", safe_truncate(&c.id, 14))?;
 
-            // Name
-            write!(out, "{:<20}", name_trunc)?;
+            // Name — dynamic width matching the header.
+            write!(out, "{:<name_width$}", name_trunc, name_width = name_width)?;
 
             // State with color
             let state_lower = c.state.to_lowercase();

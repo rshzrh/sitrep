@@ -6,7 +6,7 @@ use crossterm::{
 use std::io::{self, Write};
 
 use super::theme::theme;
-use crate::model::AppView;
+use crate::model::{AppView, RemoteTab};
 
 pub fn render_tab_bar(
     out: &mut impl Write,
@@ -19,65 +19,81 @@ pub fn render_tab_bar(
 ) -> io::Result<()> {
     let t = theme();
 
+    // Detect whether we're in remote drill-in mode. When yes, the tab
+    // bar shows REMOTE tab labels (derived from the RemoteTab) and a
+    // "◂ Fleet" prefix that reminds the user Esc goes back to overview.
+    let remote_tab: Option<&RemoteTab> = match current_view {
+        AppView::Remote { tab, .. } => Some(tab),
+        _ => None,
+    };
+
     write!(out, " ")?;
 
-    // --- System tab ---
-    let system_active = matches!(current_view, AppView::System);
-    if system_active {
-        queue!(
-            io::stdout(),
-            SetBackgroundColor(t.tab_active_bg),
-            SetForegroundColor(t.tab_active_fg)
+    if let Some(rtab) = remote_tab {
+        // "◂ Fleet" back-hint.
+        queue!(io::stdout(), SetForegroundColor(t.subtext))?;
+        write!(out, "◂ Fleet  ")?;
+        queue!(io::stdout(), ResetColor)?;
+
+        let is_system = matches!(rtab, RemoteTab::System);
+        draw_tab(out, " System ", is_system, &t)?;
+
+        write!(out, "  ")?;
+        let is_containers = matches!(
+            rtab,
+            RemoteTab::Containers | RemoteTab::ContainerLogs(_)
+        );
+        draw_tab(
+            out,
+            &format!(" Containers({}) ", container_count),
+            is_containers,
+            &t,
         )?;
+
+        if swarm_active {
+            write!(out, "  ")?;
+            let is_swarm = matches!(
+                rtab,
+                RemoteTab::Swarm
+                    | RemoteTab::SwarmServiceTasks(_, _)
+                    | RemoteTab::SwarmServiceLogs(_, _)
+            );
+            draw_tab(out, &format!(" Swarm({}) ", node_count), is_swarm, &t)?;
+        }
     } else {
-        queue!(io::stdout(), SetForegroundColor(t.tab_inactive_fg))?;
-    }
-    write!(out, " System ")?;
-    queue!(io::stdout(), ResetColor)?;
+        // Local mode — System / Containers / Swarm.
+        let system_active = matches!(current_view, AppView::System);
+        draw_tab(out, " System ", system_active, &t)?;
 
-    // --- Containers tab ---
-    if docker_available {
-        write!(out, "  ")?;
-        let containers_active = matches!(
-            current_view,
-            AppView::Containers | AppView::ContainerLogs(_)
-        );
-        if containers_active {
-            queue!(
-                io::stdout(),
-                SetBackgroundColor(t.tab_active_bg),
-                SetForegroundColor(t.tab_active_fg)
+        if docker_available {
+            write!(out, "  ")?;
+            let containers_active = matches!(
+                current_view,
+                AppView::Containers | AppView::ContainerLogs(_)
+            );
+            draw_tab(
+                out,
+                &format!(" Containers({}) ", container_count),
+                containers_active,
+                &t,
             )?;
-        } else {
-            queue!(io::stdout(), SetForegroundColor(t.tab_inactive_fg))?;
         }
-        write!(out, " Containers({}) ", container_count)?;
-        queue!(io::stdout(), ResetColor)?;
+
+        if swarm_active {
+            write!(out, "  ")?;
+            let swarm_tab_active = matches!(
+                current_view,
+                AppView::Swarm
+                    | AppView::SwarmServiceTasks(_, _)
+                    | AppView::SwarmServiceLogs(_, _)
+            );
+            draw_tab(out, &format!(" Swarm({}) ", node_count), swarm_tab_active, &t)?;
+        }
     }
 
-    // --- Swarm tab ---
-    if swarm_active {
-        write!(out, "  ")?;
-        let swarm_tab_active = matches!(
-            current_view,
-            AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _)
-        );
-        if swarm_tab_active {
-            queue!(
-                io::stdout(),
-                SetBackgroundColor(t.tab_active_bg),
-                SetForegroundColor(t.tab_active_fg)
-            )?;
-        } else {
-            queue!(io::stdout(), SetForegroundColor(t.tab_inactive_fg))?;
-        }
-        write!(out, " Swarm({}) ", node_count)?;
-        queue!(io::stdout(), ResetColor)?;
-    }
-
-    // --- Right-aligned: sitrep - HH:MM:SS ---
+    // --- Right-aligned: flotop - HH:MM:SS ---
     let size = terminal::size()?;
-    let time_str = format!("sitrep - {} ", time);
+    let time_str = format!("flotop - {} ", time);
     let col = (size.0 as usize).saturating_sub(time_str.len());
     queue!(
         io::stdout(),
@@ -95,5 +111,25 @@ pub fn render_tab_bar(
     write!(out, "{}\r\n", sep)?;
     queue!(io::stdout(), ResetColor)?;
 
+    Ok(())
+}
+
+fn draw_tab(
+    out: &mut impl Write,
+    label: &str,
+    active: bool,
+    t: &super::theme::Theme,
+) -> io::Result<()> {
+    if active {
+        queue!(
+            io::stdout(),
+            SetBackgroundColor(t.tab_active_bg),
+            SetForegroundColor(t.tab_active_fg)
+        )?;
+    } else {
+        queue!(io::stdout(), SetForegroundColor(t.tab_inactive_fg))?;
+    }
+    write!(out, "{}", label)?;
+    queue!(io::stdout(), ResetColor)?;
     Ok(())
 }

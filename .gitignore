@@ -1,1 +1,4 @@
 /target
+tests/fixtures
+src/view/snapshots
+CLAUDE.md

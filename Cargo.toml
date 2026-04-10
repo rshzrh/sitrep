@@ -1,21 +1,21 @@
 [package]
-name = "sitrep"
+name = "flotop"
 version = "0.1.0"
 edition = "2024"
-description = "A real-time terminal diagnostic tool for server triage — CPU, memory, disk, network, file descriptors, context switches, and socket overview at a glance."
+description = "Agentless multi-host TUI for triaging your fleet of VPSes when something breaks at 2am. CPU, memory, disk, network, Docker containers, and Docker Swarm at a glance — across all your boxes over SSH. (Formerly sitrep.)"
 license = "MIT"
-repository = "https://github.com/rshzrh/sitrep"
-homepage = "https://github.com/rshzrh/sitrep"
+repository = "https://github.com/rshzrh/flotop"
+homepage = "https://github.com/rshzrh/flotop"
 readme = "README.md"
 keywords = ["monitoring", "diagnostics", "terminal", "devops", "tui"]
 categories = ["command-line-utilities", "os"]
 
 [lib]
-name = "sitrep"
+name = "flotop"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sitrep"
+name = "flotop"
 path = "src/main.rs"
 
 [dependencies]
@@ -32,3 +32,12 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+russh = "0.45"
+async-trait = "0.1"
+shell-escape = "0.1"
+
+[dev-dependencies]
+insta = "1"
+tempfile = "3"
+anyhow = "1"
+russh-keys = "0.45"

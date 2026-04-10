@@ -100,6 +100,7 @@ pub struct SocketOverviewInfo {
 
 // --- Aggregated monitor data ---
 
+#[derive(Clone)]
 pub struct MonitorData {
     pub time: String,
     pub core_count: f64,
@@ -127,6 +128,7 @@ pub enum SortColumn {
     NetUp,
 }
 
+#[derive(Clone)]
 pub struct UIState {
     pub selected_index: usize,
     pub expanded_pids: HashSet<Pid>,

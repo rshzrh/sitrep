@@ -1,5 +1,6 @@
 mod confirmation;
 mod containers;
+mod fleet;
 mod logs;
 mod shared;
 mod swarm;
@@ -7,6 +8,8 @@ mod system;
 mod splash;
 mod tab_bar;
 pub mod theme;
+
+pub use fleet::{format_fleet_overview, format_remote_host_detail};
 
 use crate::layout::SectionId;
 use crossterm::{

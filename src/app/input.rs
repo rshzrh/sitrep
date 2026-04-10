@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -30,6 +31,7 @@ pub fn handle_key(app: &mut App, key_event: KeyEvent) -> Option<InputResult> {
         if code == KeyCode::Char('y') || code == KeyCode::Char('Y') {
             let pa = app.pending_action.take().unwrap();
             match pa.kind {
+                // Local Docker actions
                 PendingActionKind::ContainerStart(id) => {
                     app.docker_monitor.start_container(&id);
                 }
@@ -41,6 +43,31 @@ pub fn handle_key(app: &mut App, key_event: KeyEvent) -> Option<InputResult> {
                 }
                 PendingActionKind::SwarmRollingRestart(id) => {
                     app.swarm_monitor.force_restart_service(&id);
+                }
+                // Remote Docker actions — dispatched over SSH via RemoteHost
+                PendingActionKind::RemoteContainerStart { host_idx, id, .. } => {
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        let cmd = crate::remote_host::RemoteHost::container_action_command("start", &id);
+                        rh.run_action(Arc::clone(&app.rt), "start".into(), id, cmd);
+                    }
+                }
+                PendingActionKind::RemoteContainerStop { host_idx, id, .. } => {
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        let cmd = crate::remote_host::RemoteHost::container_action_command("stop", &id);
+                        rh.run_action(Arc::clone(&app.rt), "stop".into(), id, cmd);
+                    }
+                }
+                PendingActionKind::RemoteContainerRestart { host_idx, id, .. } => {
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        let cmd = crate::remote_host::RemoteHost::container_action_command("restart", &id);
+                        rh.run_action(Arc::clone(&app.rt), "restart".into(), id, cmd);
+                    }
+                }
+                PendingActionKind::RemoteRollingRestart { host_idx, id, .. } => {
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        let cmd = crate::remote_host::RemoteHost::swarm_rolling_restart_command(&id);
+                        rh.run_action(Arc::clone(&app.rt), "rolling-restart".into(), id, cmd);
+                    }
                 }
             }
         } else {
@@ -60,6 +87,8 @@ pub fn handle_key(app: &mut App, key_event: KeyEvent) -> Option<InputResult> {
         AppView::Swarm => handle_swarm(app, code, next_tab, prev_tab),
         AppView::SwarmServiceTasks(_, _) => handle_swarm_tasks(app, code),
         AppView::SwarmServiceLogs(_, _) => handle_service_logs(app, code),
+        AppView::FleetOverview => handle_fleet_overview(app, code),
+        AppView::Remote { .. } => handle_remote(app, code),
     };
 
     if let Some(InputResult::Quit) = result {
@@ -92,6 +121,8 @@ fn next_tab(app: &App) -> AppView {
         AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
             AppView::System
         }
+        AppView::FleetOverview => AppView::FleetOverview, // Tab is a no-op in fleet view
+        AppView::Remote { .. } => app.app_view.clone(),
     }
 }
 
@@ -116,6 +147,744 @@ fn prev_tab(app: &App) -> AppView {
                 AppView::System
             }
         }
+        AppView::FleetOverview => AppView::FleetOverview,
+        AppView::Remote { .. } => app.app_view.clone(),
+    }
+}
+
+/// Fleet overview keyboard handling. Up/Down navigate the host list,
+/// Enter drills into the selected host's remote detail view, q quits.
+fn handle_fleet_overview(app: &mut App, code: KeyCode) -> Option<InputResult> {
+    use crossterm::event::KeyCode::*;
+    let fs = app.fleet_state.as_mut()?;
+    match code {
+        Char('q') | Esc => Some(InputResult::Quit),
+        Up => {
+            fs.move_selection_up();
+            Some(InputResult::Consumed)
+        }
+        Down => {
+            fs.move_selection_down();
+            Some(InputResult::Consumed)
+        }
+        Enter | Right => {
+            let idx = fs.selected;
+            fs.drill_in();
+            app.app_view = AppView::Remote {
+                host: idx,
+                tab: crate::model::RemoteTab::System,
+            };
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+/// Remote drill-in keyboard handling. Dispatches to per-tab sub-handlers.
+/// Tab/Shift-Tab cycles tabs within remote mode. Esc/Left returns to the
+/// fleet overview. q quits.
+fn handle_remote(app: &mut App, code: KeyCode) -> Option<InputResult> {
+    use crate::model::RemoteTab;
+    use crossterm::event::KeyCode::*;
+
+    // Pull host + tab out (cloned, not a borrow) so we can mutate app.
+    let (host_idx, tab) = match &app.app_view {
+        AppView::Remote { host, tab } => (*host, tab.clone()),
+        _ => return None,
+    };
+
+    // Global keys that apply regardless of which remote tab is active.
+    // `Left` acts as "back" in nested views (logs / swarm service tasks)
+    // — matches the local binding. In the top-level tabs (System /
+    // Containers / Swarm), Left is passed through to the sub-handler
+    // because the containers tab uses Left to toggle expand/collapse.
+    let is_back_key = matches!(code, Esc)
+        || (matches!(code, Left)
+            && matches!(
+                tab,
+                RemoteTab::ContainerLogs(_)
+                    | RemoteTab::ContainerLogsMulti(_)
+                    | RemoteTab::SwarmServiceTasks(_, _)
+                    | RemoteTab::SwarmServiceLogs(_, _)
+            ));
+    match code {
+        Char('q') => return Some(InputResult::Quit),
+        _ if is_back_key => {
+            // Esc / Left from a nested view (logs, service tasks) returns
+            // one level. From a top-level tab, Esc returns to fleet.
+            match tab {
+                RemoteTab::System | RemoteTab::Containers | RemoteTab::Swarm => {
+                    if let Some(ref mut fs) = app.fleet_state {
+                        fs.drill_out();
+                    }
+                    // Clean up per-host render state on drill-out so it
+                    // doesn't grow unboundedly across repeated drill-ins.
+                    app.remote_row_mappings.remove(&host_idx);
+                    app.app_view = AppView::FleetOverview;
+                }
+                RemoteTab::ContainerLogs(ref id) => {
+                    // Stop the log stream, clear cached lines, return to Containers.
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        rh.stop_log_stream(id);
+                    }
+                    let key = (host_idx, id.clone());
+                    app.remote_log_states.remove(&key);
+                    app.app_view = AppView::Remote {
+                        host: host_idx,
+                        tab: RemoteTab::Containers,
+                    };
+                }
+                RemoteTab::ContainerLogsMulti(ref pairs) => {
+                    // Stop all active log streams + clear multi-log state.
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        for (id, _) in pairs {
+                            rh.stop_log_stream(id);
+                        }
+                        let mut s = rh.state.lock().unwrap();
+                        s.multi_log_container_ids.clear();
+                    }
+                    app.remote_multi_logs.remove(&host_idx);
+                    app.app_view = AppView::Remote {
+                        host: host_idx,
+                        tab: RemoteTab::Containers,
+                    };
+                }
+                RemoteTab::SwarmServiceTasks(_, _) => {
+                    app.app_view = AppView::Remote {
+                        host: host_idx,
+                        tab: RemoteTab::Swarm,
+                    };
+                }
+                RemoteTab::SwarmServiceLogs(ref id, _) => {
+                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                        rh.stop_log_stream(id);
+                    }
+                    app.remote_service_logs.remove(&host_idx);
+                    app.app_view = AppView::Remote {
+                        host: host_idx,
+                        tab: RemoteTab::Swarm,
+                    };
+                }
+            }
+            return Some(InputResult::Consumed);
+        }
+        Tab => {
+            // Cycle System → Containers → Swarm → System.
+            let next = match tab {
+                RemoteTab::System => RemoteTab::Containers,
+                RemoteTab::Containers => RemoteTab::Swarm,
+                RemoteTab::Swarm => RemoteTab::System,
+                // Nested views don't participate in Tab cycling.
+                _ => return Some(InputResult::Consumed),
+            };
+            app.app_view = AppView::Remote {
+                host: host_idx,
+                tab: next,
+            };
+            return Some(InputResult::Consumed);
+        }
+        BackTab => {
+            let prev = match tab {
+                RemoteTab::System => RemoteTab::Swarm,
+                RemoteTab::Containers => RemoteTab::System,
+                RemoteTab::Swarm => RemoteTab::Containers,
+                _ => return Some(InputResult::Consumed),
+            };
+            app.app_view = AppView::Remote {
+                host: host_idx,
+                tab: prev,
+            };
+            return Some(InputResult::Consumed);
+        }
+        _ => {}
+    }
+
+    // Tab-specific handlers.
+    match tab {
+        RemoteTab::System => handle_remote_system(app, host_idx, code),
+        RemoteTab::Containers => handle_remote_containers(app, host_idx, code),
+        RemoteTab::ContainerLogs(id) => handle_remote_container_logs(app, host_idx, &id, code),
+        RemoteTab::ContainerLogsMulti(_) => handle_remote_multi_log(app, host_idx, code),
+        RemoteTab::Swarm => handle_remote_swarm(app, host_idx, code),
+        RemoteTab::SwarmServiceTasks(service_id, service_name) => {
+            handle_remote_swarm_tasks(app, host_idx, &service_id, &service_name, code)
+        }
+        RemoteTab::SwarmServiceLogs(_, _) => handle_remote_service_logs(app, host_idx, code),
+    }
+}
+
+/// Remote System tab keyboard handling. Mirrors `handle_system` exactly:
+/// Up/Down navigate, Left/Right expand/collapse sections and process
+/// groups, c/m/r/w/d/u change sort column. All mutations go through the
+/// target host's `RemoteHostState` (locked briefly per mutation) so the
+/// state persists across refreshes.
+///
+/// Row-to-section mapping is resolved via `app.remote_row_mappings[host_idx]`,
+/// populated by the render path each frame.
+fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option<InputResult> {
+    use crate::model::SortColumn;
+    use crossterm::event::KeyCode::*;
+
+    let rh = app.remote_hosts.get(host_idx)?;
+
+    match code {
+        Up => {
+            let mut s = rh.state.lock().unwrap();
+            if s.ui_state.selected_index > 0 {
+                s.ui_state.selected_index -= 1;
+                return Some(InputResult::Consumed);
+            }
+            None
+        }
+        Down => {
+            let mut s = rh.state.lock().unwrap();
+            if s.ui_state.selected_index + 1 < s.ui_state.total_rows {
+                s.ui_state.selected_index += 1;
+                return Some(InputResult::Consumed);
+            }
+            None
+        }
+        Right => {
+            // Right: expand a collapsed section header. ProcessParent
+            // expansion is disabled on remote because remote ps data
+            // has no child processes — expanding would be a no-op that
+            // confusingly triggers the "frozen" warning. Section headers
+            // still toggle because they're layout state, not data.
+            let row_mapping = app.remote_row_mappings.get(&host_idx)?.clone();
+            let mut s = rh.state.lock().unwrap();
+            let idx = s.ui_state.selected_index;
+            if idx < row_mapping.len() {
+                let (_pid, kind) = row_mapping[idx];
+                if let RowKind::SectionHeader(section_id) = kind {
+                    if s.layout.is_collapsed(section_id) {
+                        s.layout.toggle_section(section_id);
+                        return Some(InputResult::Consumed);
+                    }
+                }
+                // ProcessParent: intentionally no-op on remote.
+            }
+            None
+        }
+        Left => {
+            // Left: collapse an expanded section header. ProcessParent /
+            // ProcessChild collapse is disabled on remote (no children).
+            let row_mapping = app.remote_row_mappings.get(&host_idx)?.clone();
+            let mut s = rh.state.lock().unwrap();
+            let idx = s.ui_state.selected_index;
+            if idx < row_mapping.len() {
+                let (_pid, kind) = row_mapping[idx];
+                if let RowKind::SectionHeader(section_id) = kind {
+                    if !s.layout.is_collapsed(section_id) {
+                        s.layout.toggle_section(section_id);
+                        return Some(InputResult::Consumed);
+                    }
+                }
+            }
+            None
+        }
+        Char('c') => {
+            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Cpu;
+            Some(InputResult::Consumed)
+        }
+        Char('m') => {
+            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Memory;
+            Some(InputResult::Consumed)
+        }
+        Char('r') => {
+            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Read;
+            Some(InputResult::Consumed)
+        }
+        Char('w') => {
+            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Write;
+            Some(InputResult::Consumed)
+        }
+        Char('d') => {
+            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::NetDown;
+            Some(InputResult::Consumed)
+        }
+        Char('u') => {
+            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::NetUp;
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_remote_containers(
+    app: &mut App,
+    host_idx: usize,
+    code: KeyCode,
+) -> Option<InputResult> {
+    use crate::model::RemoteTab;
+    use crossterm::event::KeyCode::*;
+
+    let rh = app.remote_hosts.get(host_idx)?;
+    match code {
+        Up => {
+            let mut s = rh.state.lock().unwrap();
+            if s.container_ui.selected_index > 0 {
+                s.container_ui.selected_index -= 1;
+                s.container_ui.selected_id = s
+                    .containers
+                    .get(s.container_ui.selected_index)
+                    .map(|c| c.id.clone());
+                s.status_message = None;
+            }
+            Some(InputResult::Consumed)
+        }
+        Down => {
+            let mut s = rh.state.lock().unwrap();
+            let max = s.containers.len().saturating_sub(1);
+            if s.container_ui.selected_index < max {
+                s.container_ui.selected_index += 1;
+                s.container_ui.selected_id = s
+                    .containers
+                    .get(s.container_ui.selected_index)
+                    .map(|c| c.id.clone());
+                s.status_message = None;
+            }
+            Some(InputResult::Consumed)
+        }
+        Right => {
+            // Open log view for the selected container.
+            let s = rh.state.lock().unwrap();
+            let idx = s.container_ui.selected_index;
+            let container_id = s.containers.get(idx).map(|c| c.id.clone());
+            drop(s);
+            if let Some(cid) = container_id {
+                let rt = Arc::clone(&app.rt);
+                rh.start_container_log_stream(rt, cid.clone());
+                app.app_view = AppView::Remote {
+                    host: host_idx,
+                    tab: RemoteTab::ContainerLogs(cid),
+                };
+            }
+            Some(InputResult::Consumed)
+        }
+        Left => {
+            // Toggle expand/collapse of the selected container's details.
+            let mut s = rh.state.lock().unwrap();
+            let idx = s.container_ui.selected_index;
+            if let Some(c) = s.containers.get(idx).cloned() {
+                if s.container_ui.expanded_ids.contains(&c.id) {
+                    s.container_ui.expanded_ids.remove(&c.id);
+                } else {
+                    s.container_ui.expanded_ids.insert(c.id);
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Char(' ') => {
+            // Toggle multi-select marker on the selected container.
+            let mut s = rh.state.lock().unwrap();
+            let idx = s.container_ui.selected_index;
+            if let Some(c) = s.containers.get(idx).cloned() {
+                if s.container_ui.selected_containers.contains(&c.id) {
+                    s.container_ui.selected_containers.remove(&c.id);
+                } else {
+                    s.container_ui.selected_containers.insert(c.id);
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Char('l') | Char('L') => {
+            // Open a multi-container log view for all selected containers.
+            let s = rh.state.lock().unwrap();
+            let selected: Vec<(String, String)> = s
+                .containers
+                .iter()
+                .filter(|c| s.container_ui.selected_containers.contains(&c.id))
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect();
+            drop(s);
+            if !selected.is_empty() {
+                let ids: Vec<String> = selected.iter().map(|(id, _)| id.clone()).collect();
+                // Start a log stream for each selected container.
+                for (id, _) in &selected {
+                    let rt = Arc::clone(&app.rt);
+                    rh.start_container_log_stream(rt, id.clone());
+                }
+                // Record which containers are in the multi-log so the
+                // log-poll routine routes their lines into the multi-log
+                // state instead of the per-container state.
+                {
+                    let mut s2 = rh.state.lock().unwrap();
+                    s2.multi_log_container_ids = ids;
+                }
+                app.app_view = AppView::Remote {
+                    host: host_idx,
+                    tab: RemoteTab::ContainerLogsMulti(selected),
+                };
+            }
+            Some(InputResult::Consumed)
+        }
+        // Uppercase S/T/R with y/n confirmation — mirrors the local
+        // bindings. Creates a PendingAction with a Remote* variant so
+        // the user sees "Restart container 'foo' on root@host?" and has
+        // to press y to confirm. The pending-action dispatcher at the
+        // top of handle_key routes the confirmed action to
+        // RemoteHost::run_action over SSH.
+        Char('S') | Char('T') | Char('R') => {
+            let s = rh.state.lock().unwrap();
+            let idx = s.container_ui.selected_index;
+            let container = s.containers.get(idx).cloned();
+            drop(s);
+            if let Some(c) = container {
+                let host_name = rh.auth.display();
+                let kind = match code {
+                    Char('S') => PendingActionKind::RemoteContainerStart {
+                        host_idx,
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                    },
+                    Char('T') => PendingActionKind::RemoteContainerStop {
+                        host_idx,
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                    },
+                    Char('R') => PendingActionKind::RemoteContainerRestart {
+                        host_idx,
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                    },
+                    _ => unreachable!(),
+                };
+                let verb = match code {
+                    Char('S') => "Start",
+                    Char('T') => "Stop",
+                    Char('R') => "Restart",
+                    _ => unreachable!(),
+                };
+                app.pending_action = Some(PendingAction {
+                    description: format!(
+                        "{} container '{}' on {}? (y/n)",
+                        verb, c.name, host_name
+                    ),
+                    kind,
+                    expires: Instant::now() + Duration::from_secs(5),
+                });
+            }
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_remote_container_logs(
+    app: &mut App,
+    host_idx: usize,
+    container_id: &str,
+    code: KeyCode,
+) -> Option<InputResult> {
+    use crossterm::event::KeyCode::*;
+    let key = (host_idx, container_id.to_string());
+
+    // ── search mode: when active, intercept character input ──
+    if let Some(log_state) = app.remote_log_states.get(&key) {
+        if log_state.search_mode {
+            let log_state = app.remote_log_states.get_mut(&key).unwrap();
+            return match code {
+                Enter => {
+                    log_state.search_mode = false;
+                    Some(InputResult::Consumed)
+                }
+                Esc => {
+                    log_state.search_mode = false;
+                    log_state.search_query.clear();
+                    Some(InputResult::Consumed)
+                }
+                Backspace => {
+                    log_state.search_query.pop();
+                    Some(InputResult::Consumed)
+                }
+                Char(c) => {
+                    log_state.search_query.push(c);
+                    Some(InputResult::Consumed)
+                }
+                _ => Some(InputResult::Consumed), // swallow all keys in search mode
+            };
+        }
+    }
+
+    // ── normal mode ──
+    // ALWAYS consume navigation keys even if log_state doesn't exist
+    // yet (still waiting for the first line).
+    match code {
+        Char('/') => {
+            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+                log_state.search_mode = true;
+                log_state.search_query.clear();
+            }
+            Some(InputResult::Consumed)
+        }
+        Up => {
+            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+                if log_state.scroll_offset < log_state.lines.len().saturating_sub(1) {
+                    log_state.scroll_offset += 1;
+                    log_state.auto_follow = false;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Down => {
+            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+                if log_state.scroll_offset > 0 {
+                    log_state.scroll_offset -= 1;
+                }
+                if log_state.scroll_offset == 0 {
+                    log_state.auto_follow = true;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        PageUp => {
+            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+                let page = 20;
+                log_state.scroll_offset = log_state
+                    .scroll_offset
+                    .saturating_add(page)
+                    .min(log_state.lines.len().saturating_sub(1));
+                log_state.auto_follow = false;
+            }
+            Some(InputResult::Consumed)
+        }
+        PageDown => {
+            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+                log_state.scroll_offset = log_state.scroll_offset.saturating_sub(20);
+                if log_state.scroll_offset == 0 {
+                    log_state.auto_follow = true;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Char('f') | End => {
+            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+                log_state.scroll_offset = 0;
+                log_state.auto_follow = true;
+            }
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_remote_multi_log(app: &mut App, host_idx: usize, code: KeyCode) -> Option<InputResult> {
+    use crossterm::event::KeyCode::*;
+    // Always-consume pattern. Multi-log scrolling — same as container logs.
+    match code {
+        Up => {
+            if let Some(ml) = app.remote_multi_logs.get_mut(&host_idx) {
+                if ml.scroll_offset < ml.lines.len().saturating_sub(1) {
+                    ml.scroll_offset += 1;
+                    ml.auto_follow = false;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Down => {
+            if let Some(ml) = app.remote_multi_logs.get_mut(&host_idx) {
+                if ml.scroll_offset > 0 {
+                    ml.scroll_offset -= 1;
+                }
+                if ml.scroll_offset == 0 {
+                    ml.auto_follow = true;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Char('f') | End => {
+            if let Some(ml) = app.remote_multi_logs.get_mut(&host_idx) {
+                ml.scroll_offset = 0;
+                ml.auto_follow = true;
+            }
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_remote_swarm(app: &mut App, host_idx: usize, code: KeyCode) -> Option<InputResult> {
+    use crate::model::RemoteTab;
+    use crossterm::event::KeyCode::*;
+    let rh = app.remote_hosts.get(host_idx)?;
+    match code {
+        Up => {
+            let mut s = rh.state.lock().unwrap();
+            if s.swarm_ui.selected_index > 0 {
+                s.swarm_ui.selected_index -= 1;
+            }
+            Some(InputResult::Consumed)
+        }
+        Down => {
+            let mut s = rh.state.lock().unwrap();
+            // Upper bound is the overview row count — use service count
+            // as a safe approximation since we don't track row mapping
+            // separately for the remote swarm view.
+            let max = s.swarm_services.len().saturating_sub(1);
+            if s.swarm_ui.selected_index < max {
+                s.swarm_ui.selected_index += 1;
+            }
+            Some(InputResult::Consumed)
+        }
+        Char('R') => {
+            // Rolling-restart with confirmation.
+            let s = rh.state.lock().unwrap();
+            let idx = s.swarm_ui.selected_index.min(s.swarm_services.len().saturating_sub(1));
+            let svc = s.swarm_services.get(idx).cloned();
+            drop(s);
+            if let Some(svc) = svc {
+                let host_name = rh.auth.display();
+                app.pending_action = Some(PendingAction {
+                    description: format!(
+                        "Rolling-restart service '{}' on {}? (y/n)",
+                        svc.name, host_name
+                    ),
+                    kind: PendingActionKind::RemoteRollingRestart {
+                        host_idx,
+                        id: svc.id,
+                        name: svc.name,
+                    },
+                    expires: Instant::now() + Duration::from_secs(5),
+                });
+            }
+            Some(InputResult::Consumed)
+        }
+        Right | Enter => {
+            // Drill into the selected service's tasks.
+            let s = rh.state.lock().unwrap();
+            let idx = s.swarm_ui.selected_index.min(s.swarm_services.len().saturating_sub(1));
+            let svc = s.swarm_services.get(idx).cloned();
+            drop(s);
+            if let Some(svc) = svc {
+                app.app_view = AppView::Remote {
+                    host: host_idx,
+                    tab: RemoteTab::SwarmServiceTasks(svc.id, svc.name),
+                };
+            }
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_remote_swarm_tasks(
+    app: &mut App,
+    host_idx: usize,
+    service_id: &str,
+    service_name: &str,
+    code: KeyCode,
+) -> Option<InputResult> {
+    use crate::model::RemoteTab;
+    use crossterm::event::KeyCode::*;
+    match code {
+        Char('L') | Right => {
+            // Start streaming service logs.
+            if let Some(rh) = app.remote_hosts.get(host_idx) {
+                let rt = Arc::clone(&app.rt);
+                rh.start_service_log_stream(rt, service_id.to_string());
+            }
+            app.app_view = AppView::Remote {
+                host: host_idx,
+                tab: RemoteTab::SwarmServiceLogs(service_id.into(), service_name.into()),
+            };
+            Some(InputResult::Consumed)
+        }
+        _ => None,
+    }
+}
+
+fn handle_remote_service_logs(
+    app: &mut App,
+    host_idx: usize,
+    code: KeyCode,
+) -> Option<InputResult> {
+    use crossterm::event::KeyCode::*;
+
+    // ── search mode ──
+    if let Some(log_state) = app.remote_service_logs.get(&host_idx) {
+        if log_state.search_mode {
+            let log_state = app.remote_service_logs.get_mut(&host_idx).unwrap();
+            return match code {
+                Enter => {
+                    log_state.search_mode = false;
+                    Some(InputResult::Consumed)
+                }
+                Esc => {
+                    log_state.search_mode = false;
+                    log_state.search_query.clear();
+                    Some(InputResult::Consumed)
+                }
+                Backspace => {
+                    log_state.search_query.pop();
+                    Some(InputResult::Consumed)
+                }
+                Char(c) => {
+                    log_state.search_query.push(c);
+                    Some(InputResult::Consumed)
+                }
+                _ => Some(InputResult::Consumed),
+            };
+        }
+    }
+
+    // ── normal mode ──
+    match code {
+        Char('/') => {
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                log_state.search_mode = true;
+                log_state.search_query.clear();
+            }
+            Some(InputResult::Consumed)
+        }
+        Char('e') => {
+            // Toggle error-only filter (ERROR, panic, fatal, exception).
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                log_state.filter_errors = !log_state.filter_errors;
+            }
+            Some(InputResult::Consumed)
+        }
+        Up => {
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                log_state.scroll_offset = log_state.scroll_offset.saturating_add(1);
+                log_state.auto_follow = false;
+            }
+            Some(InputResult::Consumed)
+        }
+        Down => {
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                if log_state.scroll_offset > 0 {
+                    log_state.scroll_offset -= 1;
+                }
+                if log_state.scroll_offset == 0 {
+                    log_state.auto_follow = true;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        PageUp => {
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                log_state.scroll_offset = log_state.scroll_offset.saturating_add(20);
+                log_state.auto_follow = false;
+            }
+            Some(InputResult::Consumed)
+        }
+        PageDown => {
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                log_state.scroll_offset = log_state.scroll_offset.saturating_sub(20);
+                if log_state.scroll_offset == 0 {
+                    log_state.auto_follow = true;
+                }
+            }
+            Some(InputResult::Consumed)
+        }
+        Char('f') | End => {
+            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+                log_state.scroll_offset = 0;
+                log_state.auto_follow = true;
+            }
+            Some(InputResult::Consumed)
+        }
+        _ => None,
     }
 }
 
