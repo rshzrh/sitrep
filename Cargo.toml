@@ -1,6 +1,6 @@
 [package]
 name = "flotop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Agentless multi-host TUI for triaging your fleet of VPSes when something breaks at 2am. CPU, memory, disk, network, Docker containers, and Docker Swarm at a glance — across all your boxes over SSH. (Formerly sitrep.)"
 license = "MIT"

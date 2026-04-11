@@ -40,10 +40,13 @@ cargo build --release
 ./target/release/flotop
 ```
 
-### Docker
+### Docker (build locally)
+
+A `Dockerfile` is included for building flotop on Linux — useful for testing the Linux code path from a macOS host. There is no prebuilt image on any registry.
 
 ```bash
-docker run --rm -it --pid=host --net=host ghcr.io/rshzrh/flotop
+docker build -t flotop .
+docker run --rm -it --pid=host --net=host flotop
 ```
 
 ## How it works
