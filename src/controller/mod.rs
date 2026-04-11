@@ -43,6 +43,13 @@ struct MonitorWorkerState {
     networks: Networks,
     prev_net_snapshot: Option<(Instant, Vec<(String, u64, u64)>)>,
     collector: Box<dyn SystemCollector>,
+    /// `false` until the first `collect_snapshot` has run. The very
+    /// first snapshot skips `sys.refresh_all()` / `disks.refresh()` /
+    /// `networks.refresh()` because `Monitor::new` already did a full
+    /// `System::new_all()` a few hundred ms earlier — refreshing again
+    /// immediately is pure wasted work and shows up as first-frame
+    /// latency.
+    warmed_up: bool,
 }
 
 struct MonitorUpdateResult {
@@ -52,8 +59,10 @@ struct MonitorUpdateResult {
 
 impl Monitor {
     pub fn new() -> Self {
-        let mut sys = System::new_all();
-        sys.refresh_all();
+        // `System::new_all()` is `System::new() + refresh_all()` in one
+        // shot — no need to call `refresh_all()` after it. Dropping the
+        // redundant refresh saves 100–500ms of cold-start latency.
+        let sys = System::new_all();
         let core_count = sys.cpus().len() as f64;
         let disks = Disks::new_with_refreshed_list();
         let networks = Networks::new_with_refreshed_list();
@@ -79,6 +88,7 @@ impl Monitor {
                 networks,
                 prev_net_snapshot: None,
                 collector,
+                warmed_up: false,
             }),
             update_receiver: None,
             active_flag,
@@ -136,9 +146,18 @@ impl Monitor {
 
 impl MonitorWorkerState {
     fn collect_snapshot(&mut self, sort_column: crate::model::SortColumn) -> MonitorData {
-        self.sys.refresh_all();
-        self.disks.refresh(true);
-        self.networks.refresh(true);
+        // First tick skips all three refreshes — `Monitor::new` did a
+        // full `System::new_all()` plus disk/network refresh only
+        // milliseconds ago. Refreshing again now just pays the cost
+        // twice and gates the first frame on it. Subsequent ticks
+        // refresh normally.
+        if self.warmed_up {
+            self.sys.refresh_all();
+            self.disks.refresh(true);
+            self.networks.refresh(true);
+        } else {
+            self.warmed_up = true;
+        }
 
         let now_chrono = Local::now();
         let now_instant = Instant::now();
