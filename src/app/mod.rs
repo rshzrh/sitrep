@@ -198,25 +198,30 @@ impl App {
                 continue;
             };
 
-            // Snapshot the multi-log container ids (under a brief lock)
-            // so we know how to route lines for this tick.
-            let multi_ids: Vec<String> = {
+            // Snapshot everything we need in one brief lock: the
+            // multi-log ids, the container id set (for O(1) routing),
+            // and an Arc clone of the container list (for name lookup
+            // without re-locking per line). All three are Arc clones
+            // so the lock releases immediately.
+            let (multi_ids, container_ids, containers_arc) = {
                 let s = rh.state.lock();
-                s.multi_log_container_ids.clone()
+                (
+                    s.multi_log_container_ids.clone(),
+                    Arc::clone(&s.container_ids),
+                    Arc::clone(&s.containers),
+                )
             };
 
             while let Ok(line) = rx.try_recv() {
                 // Route 1: multi-log view active and this container is in it.
                 if !multi_ids.is_empty() && multi_ids.contains(&line.stream_id) {
-                    // Look up the container name for the prefix.
-                    let name = {
-                        let s = rh.state.lock();
-                        s.containers
-                            .iter()
-                            .find(|c| c.id == line.stream_id)
-                            .map(|c| c.name.clone())
-                            .unwrap_or_else(|| line.stream_id.clone())
-                    };
+                    // Look up the container name for the prefix — no lock
+                    // needed because we already Arc-cloned the container list.
+                    let name = containers_arc
+                        .iter()
+                        .find(|c| c.id == line.stream_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_else(|| line.stream_id.clone());
                     let multi = self
                         .remote_multi_logs
                         .entry(i)
@@ -232,10 +237,9 @@ impl App {
                     continue;
                 }
 
-                // Route 2: single-container log.
-                let rh_state = rh.state.lock();
-                let is_container = rh_state.containers.iter().any(|c| c.id == line.stream_id);
-                drop(rh_state);
+                // Route 2: single-container log — O(1) HashSet membership
+                // check instead of a linear scan over the container Vec.
+                let is_container = container_ids.contains(&line.stream_id);
                 if is_container {
                     let key = (i, line.stream_id.clone());
                     let log_state = self

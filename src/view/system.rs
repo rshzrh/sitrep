@@ -7,7 +7,8 @@ use std::io::{self, stdout, Write};
 use sysinfo::Pid;
 
 use super::shared::{
-    format_bytes_rate, format_mem_human, load_avg_color, render_bar, render_help_footer,
+    format_bytes_rate, load_avg_color, render_bar, render_help_footer, write_bytes_rate,
+    write_mem_human,
 };
 use super::theme::theme;
 use super::RowKind;
@@ -270,11 +271,19 @@ pub fn render(
     write!(out, "\r\n")?;
 
     // ── Process rows ──
+    //
+    // Reusable String buffers for the formatting helpers. Allocated
+    // once per render instead of per-row. For a typical 30-row process
+    // table this drops ~180 String allocations per frame to 3. See P7
+    // in the eng review.
+    let mut mem_buf = String::with_capacity(8);
+    let mut net_buf = String::with_capacity(12);
+    let mut pid_buf = String::with_capacity(8);
     for g in &data.historical_top {
-        let mem_str = format_mem_human(g.mem);
+        write_mem_human(&mut mem_buf, g.mem);
         let net_total = g.net_rx_bytes.saturating_add(g.net_tx_bytes);
-        let net_str = format_bytes_rate(net_total);
-        let time_str = "-".to_string(); // CPU time not directly available in model
+        write_bytes_rate(&mut net_buf, net_total);
+        let time_str = "-"; // CPU time not directly available in model
 
         // Determine CPU color
         let cpu_color = if g.cpu > 80.0 {
@@ -300,8 +309,10 @@ pub fn render(
         // Without this indirection, 7-digit remote PIDs render with zero
         // padding and run straight into the USER column.
         queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
-        let pid_str = format!("{}", g.pid);
-        write!(out, "  {:<9}", pid_str)?;
+        pid_buf.clear();
+        use std::fmt::Write as _;
+        let _ = write!(pid_buf, "{}", g.pid);
+        write!(out, "  {:<9}", pid_buf)?;
 
         // USER
         let user_display = if g.user.len() > 9 {
@@ -318,11 +329,11 @@ pub fn render(
 
         // MEM
         queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.text }))?;
-        write!(out, "{:<6} ", mem_str)?;
+        write!(out, "{:<6} ", mem_buf)?;
 
         // NET I/O
         queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.subtext }))?;
-        write!(out, "{:<10} ", net_str)?;
+        write!(out, "{:<10} ", net_buf)?;
 
         // TIME+
         queue!(out, SetForegroundColor(if is_selected { t.selected_fg } else { t.subtext }))?;
@@ -349,8 +360,11 @@ pub fn render(
         if ui_state.expanded_pids.contains(&g.pid) {
             for child in &g.children {
                 let child_is_selected = current_row == ui_state.selected_index;
-                let child_mem = format_mem_human(child.mem);
-                let child_net = format_bytes_rate(
+                // Reuse the parent row's buffers for children. The
+                // buffers are cleared inside write_*.
+                write_mem_human(&mut mem_buf, child.mem);
+                write_bytes_rate(
+                    &mut net_buf,
                     child.net_rx_bytes.saturating_add(child.net_tx_bytes),
                 );
                 let child_cpu_color = if child.cpu as f64 > 80.0 {
@@ -367,8 +381,9 @@ pub fn render(
 
                 // Indented PID (pre-format for the same reason as parent PID)
                 queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
-                let child_pid_str = format!("{}", child.pid);
-                write!(out, "      {:<5}  ", child_pid_str)?;
+                pid_buf.clear();
+                let _ = write!(pid_buf, "{}", child.pid);
+                write!(out, "      {:<5}  ", pid_buf)?;
 
                 // USER
                 let child_user = if child.user.len() > 9 {
@@ -385,11 +400,11 @@ pub fn render(
 
                 // MEM
                 queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.text }))?;
-                write!(out, "{:<6} ", child_mem)?;
+                write!(out, "{:<6} ", mem_buf)?;
 
                 // NET I/O
                 queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.subtext }))?;
-                write!(out, "{:<10} ", child_net)?;
+                write!(out, "{:<10} ", net_buf)?;
 
                 // TIME+
                 queue!(out, SetForegroundColor(if child_is_selected { t.selected_fg } else { t.subtext }))?;

@@ -74,19 +74,13 @@ pub fn render(app: &mut App) -> io::Result<()> {
             }
         }
         crate::model::AppView::ContainerLogsMulti(_) => {
-            // Build the indicator list from actually active log streams,
-            // not just the names captured when entering the view.
-            let mut active_names: Vec<String> = app
-                .docker_monitor
-                .log_states
-                .values()
-                .map(|s| s.container_name.clone())
-                .collect();
-            active_names.sort();
-            active_names.dedup();
-
+            // `active_log_names` is maintained incrementally by
+            // start_log_stream / stop_log_stream — no per-frame rebuild.
             if let Some(ref multi_state) = app.docker_monitor.multi_log_state {
-                Presenter::render_multi_container_logs(multi_state, &active_names)?;
+                Presenter::render_multi_container_logs(
+                    multi_state,
+                    &app.docker_monitor.active_log_names,
+                )?;
             }
         }
         crate::model::AppView::Swarm | crate::model::AppView::SwarmServiceTasks(_, _) => {
@@ -167,14 +161,19 @@ struct RemoteRenderSnapshot {
     time_str: String,
     status_msg: Option<String>,
     monitor_data: Option<crate::model::MonitorData>,
-    containers: Vec<crate::model::DockerContainerInfo>,
+    /// Heavy data Vecs are held as `Arc<Vec<T>>` so cloning them out of
+    /// the state mutex is a pointer bump, not a deep copy. Call sites
+    /// that pass `&[T]` to view functions use `&*snap.containers` etc.
+    containers: std::sync::Arc<Vec<crate::model::DockerContainerInfo>>,
     container_ui: crate::model::ContainerUIState,
     swarm_info: Option<crate::model::SwarmClusterInfo>,
-    swarm_nodes: Vec<crate::model::SwarmNodeInfo>,
-    swarm_stacks: Vec<crate::model::SwarmStackInfo>,
-    swarm_services: Vec<crate::model::SwarmServiceInfo>,
-    swarm_warnings: Vec<String>,
-    swarm_service_tasks: std::collections::HashMap<String, Vec<crate::model::SwarmTaskInfo>>,
+    swarm_nodes: std::sync::Arc<Vec<crate::model::SwarmNodeInfo>>,
+    swarm_stacks: std::sync::Arc<Vec<crate::model::SwarmStackInfo>>,
+    swarm_services: std::sync::Arc<Vec<crate::model::SwarmServiceInfo>>,
+    swarm_warnings: std::sync::Arc<Vec<String>>,
+    swarm_service_tasks: std::sync::Arc<
+        std::collections::HashMap<String, Vec<crate::model::SwarmTaskInfo>>,
+    >,
     swarm_ui: crate::model::SwarmUIState,
     container_count: usize,
     swarm_active: bool,
@@ -300,7 +299,11 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
             }
         }
         RemoteTab::Containers => {
-            Presenter::render_containers(&snap.containers, &snap.container_ui, &snap.status_msg)?;
+            Presenter::render_containers(
+                snap.containers.as_slice(),
+                &snap.container_ui,
+                &snap.status_msg,
+            )?;
         }
         RemoteTab::ContainerLogs(container_id) => {
             let key = (host_idx, container_id.clone());
@@ -331,13 +334,13 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
         RemoteTab::Swarm => {
             Presenter::render_swarm_overview(
                 &snap.swarm_info,
-                &snap.swarm_nodes,
-                &snap.swarm_stacks,
-                &snap.swarm_services,
+                snap.swarm_nodes.as_slice(),
+                snap.swarm_stacks.as_slice(),
+                snap.swarm_services.as_slice(),
                 &snap.swarm_ui,
-                &snap.swarm_warnings,
+                snap.swarm_warnings.as_slice(),
                 &snap.status_msg,
-                &snap.swarm_service_tasks,
+                snap.swarm_service_tasks.as_ref(),
             )?;
         }
         RemoteTab::SwarmServiceTasks(_, service_name) => {
@@ -350,7 +353,7 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
             Presenter::render_swarm_tasks(
                 service_name,
                 &flat,
-                &snap.swarm_nodes,
+                snap.swarm_nodes.as_slice(),
                 0,
                 &snap.status_msg,
             )?;

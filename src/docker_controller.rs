@@ -28,6 +28,11 @@ pub struct DockerMonitor {
     pub multi_log_state: Option<MultiLogViewState>,
     log_receivers: HashMap<String, mpsc::Receiver<String>>,
     multi_log_seq: u64,
+    /// Sorted + deduped list of active log-stream container names.
+    /// Kept incrementally in sync with `log_states` so the multi-log
+    /// render path (fires every ~100ms) doesn't rebuild it from scratch
+    /// every frame. See P6 in the eng review.
+    pub active_log_names: Vec<String>,
     rt: Arc<tokio::runtime::Runtime>,
     pub docker_available: bool,
     pub status_message: Option<String>,
@@ -60,6 +65,7 @@ impl DockerMonitor {
             multi_log_state: None,
             log_receivers: HashMap::new(),
             multi_log_seq: 0,
+            active_log_names: Vec::new(),
             rt,
             docker_available,
             status_message: None,
@@ -220,9 +226,16 @@ impl DockerMonitor {
         let handle = self.rt.handle();
         let rx = client.tail_logs(container_id, handle);
 
+        let name_owned = container_name.to_string();
+        // Maintain the sorted+deduped cache as an incremental insert.
+        // binary_search returns Err(pos) when the value isn't present,
+        // giving us exactly the index to insert at to keep it sorted.
+        if let Err(pos) = self.active_log_names.binary_search(&name_owned) {
+            self.active_log_names.insert(pos, name_owned.clone());
+        }
         self.log_states.insert(
             container_id.to_string(),
-            LogViewState::new(container_id.to_string(), container_name.to_string()),
+            LogViewState::new(container_id.to_string(), name_owned),
         );
         self.log_receivers.insert(container_id.to_string(), rx);
     }
@@ -244,6 +257,7 @@ impl DockerMonitor {
     pub fn stop_log_stream(&mut self) {
         self.log_receivers.clear();
         self.log_states.clear();
+        self.active_log_names.clear();
         self.multi_log_state = None;
         self.multi_log_seq = 0;
     }

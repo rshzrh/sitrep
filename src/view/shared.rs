@@ -76,12 +76,24 @@ pub fn write_selectable(out: &mut impl Write, text: &str, selected: bool) -> io:
 }
 
 pub fn format_bytes_rate(bytes: u64) -> String {
+    let mut s = String::with_capacity(12);
+    write_bytes_rate(&mut s, bytes);
+    s
+}
+
+/// Write a human-readable byte rate into a reusable String buffer.
+/// The buffer is cleared before writing. Exists so hot render loops
+/// can reuse one String across hundreds of process rows instead of
+/// allocating a fresh String per row. See P7 in the eng review.
+pub fn write_bytes_rate(buf: &mut String, bytes: u64) {
+    use std::fmt::Write as _;
+    buf.clear();
     if bytes > 1_048_576 {
-        format!("{:.2} MB/s", bytes as f64 / 1_048_576.0)
+        let _ = write!(buf, "{:.2} MB/s", bytes as f64 / 1_048_576.0);
     } else if bytes > 1024 {
-        format!("{:.2} KB/s", bytes as f64 / 1024.0)
+        let _ = write!(buf, "{:.2} KB/s", bytes as f64 / 1024.0);
     } else {
-        format!("{} B/s", bytes)
+        let _ = write!(buf, "{bytes} B/s");
     }
 }
 
@@ -214,19 +226,23 @@ pub fn render_help_footer(
     Ok(())
 }
 
-/// Format bytes into human-readable form (e.g., "973M", "1.5G", "256K").
-pub fn format_mem_human(bytes: u64) -> String {
+/// Write a human-readable memory size into a reusable String buffer.
+/// The buffer is cleared before writing. See `write_bytes_rate` for
+/// the reuse-buffer pattern rationale.
+pub fn write_mem_human(buf: &mut String, bytes: u64) {
+    use std::fmt::Write as _;
+    buf.clear();
     let gb = bytes as f64 / 1_073_741_824.0;
     let mb = bytes as f64 / 1_048_576.0;
     let kb = bytes as f64 / 1024.0;
     if gb >= 1.0 {
-        format!("{:.1}G", gb)
+        let _ = write!(buf, "{gb:.1}G");
     } else if mb >= 1.0 {
-        format!("{:.0}M", mb)
+        let _ = write!(buf, "{mb:.0}M");
     } else if kb >= 1.0 {
-        format!("{:.0}K", kb)
+        let _ = write!(buf, "{kb:.0}K");
     } else {
-        format!("{}B", bytes)
+        let _ = write!(buf, "{bytes}B");
     }
 }
 
