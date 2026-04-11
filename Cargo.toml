@@ -32,7 +32,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-russh = "0.45"
+russh = "0.60"
 async-trait = "0.1"
 shell-escape = "0.1"
 parking_lot = "0.12"
