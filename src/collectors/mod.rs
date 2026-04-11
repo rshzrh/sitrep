@@ -47,6 +47,13 @@ pub trait SystemCollector: Send {
     /// Returns a map of Pid -> (rx_bytes, tx_bytes).
     fn get_process_network_stats(&mut self) -> HashMap<Pid, (u64, u64)>;
 
+    /// Tell the collector whether the System tab is currently the
+    /// active (user-visible) tab. Collectors that run expensive
+    /// background work (e.g. the macOS `nettop` subprocess loop) can
+    /// pause that work when the tab is inactive. Default impl is a
+    /// no-op — Linux reads /proc on demand and doesn't need this.
+    fn set_active(&self, _active: bool) {}
+
     /// Collect everything in one shot. Default impl calls the five
     /// per-metric methods sequentially — fine for local collectors where
     /// each call is ~free. Remote collectors should override this with a

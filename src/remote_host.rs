@@ -29,7 +29,9 @@ use crate::model::{
 use crate::remote_docker::{run_remote_command, shell_escape_id};
 use russh::keys::load_secret_key;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
@@ -121,7 +123,7 @@ pub struct RemoteHost {
     session: Arc<tokio::sync::Mutex<Option<Arc<russh::client::Handle<ClientHandler>>>>>,
 
     /// Active log stream tasks, keyed by `stream_id` (container or service id).
-    log_tasks: Arc<std::sync::Mutex<HashMap<String, AbortHandle>>>,
+    log_tasks: Arc<Mutex<HashMap<String, AbortHandle>>>,
 
     /// mpsc for log lines streaming from all active log tasks on this host.
     log_tx: UnboundedSender<RemoteLogLine>,
@@ -144,7 +146,7 @@ impl RemoteHost {
             auth,
             state: Arc::new(Mutex::new(RemoteHostState::default())),
             session: Arc::new(tokio::sync::Mutex::new(None)),
-            log_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            log_tasks: Arc::new(Mutex::new(HashMap::new())),
             log_tx,
             log_rx: Some(log_rx),
             action_tx,
@@ -181,7 +183,7 @@ impl RemoteHost {
                             Err(e) => {
                                 let msg = e.to_string();
                                 {
-                                    let mut s = state.lock().unwrap();
+                                    let mut s = state.lock();
                                     s.conn_state = if consecutive_failures >= 3 {
                                         ConnState::Disconnected
                                     } else {
@@ -211,7 +213,7 @@ impl RemoteHost {
                 match do_full_refresh(&session, &state).await {
                     Ok(()) => {
                         consecutive_failures = 0;
-                        let mut s = state.lock().unwrap();
+                        let mut s = state.lock();
                         s.conn_state = ConnState::Connected;
                         s.last_error = None;
                         s.last_refresh = Some(Instant::now());
@@ -222,7 +224,7 @@ impl RemoteHost {
                         tracing::warn!(host = %host_name, error = %msg, "remote_host: refresh failed");
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         {
-                            let mut s = state.lock().unwrap();
+                            let mut s = state.lock();
                             s.conn_state = if consecutive_failures >= 3 {
                                 ConnState::Disconnected
                             } else {
@@ -313,14 +315,14 @@ impl RemoteHost {
                 }
             }
         });
-        let mut tasks = self.log_tasks.lock().unwrap();
+        let mut tasks = self.log_tasks.lock();
         tasks.insert(stream_id, handle.abort_handle());
     }
 
     /// Stop a running log stream for a container/service id. No-op if
     /// no stream was active.
     pub fn stop_log_stream(&self, stream_id: &str) {
-        let mut tasks = self.log_tasks.lock().unwrap();
+        let mut tasks = self.log_tasks.lock();
         if let Some(handle) = tasks.remove(stream_id) {
             handle.abort();
             tracing::info!(stream_id = %stream_id, "remote_host: log stream stopped");
@@ -329,7 +331,7 @@ impl RemoteHost {
 
     /// Stop ALL active log streams (called when App shuts down).
     pub fn stop_all_log_streams(&self) {
-        let mut tasks = self.log_tasks.lock().unwrap();
+        let mut tasks = self.log_tasks.lock();
         for (_, handle) in tasks.drain() {
             handle.abort();
         }
@@ -472,7 +474,7 @@ async fn do_full_refresh(
         .map(|(name, rx, tx)| (name.clone(), (*rx, *tx)))
         .collect();
     let (busy_pct, iface_rates) = {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock();
 
         // Disk busy % delta
         let busy = match (&s.prev_diskstats, s.prev_diskstats_at) {
@@ -541,7 +543,7 @@ async fn do_full_refresh(
 
     // ── Apply updates ──
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock();
         s.monitor_data = Some(monitor_data);
         if let Ok(containers) = containers_result {
             s.containers = containers;
@@ -810,7 +812,7 @@ mod tests {
     fn remote_host_new_starts_disconnected() {
         let auth = SshAuth::parse("test@example.com", "root");
         let host = RemoteHost::new(0, auth);
-        let state = host.state.lock().unwrap();
+        let state = host.state.lock();
         assert!(matches!(state.conn_state, ConnState::Disconnected));
         assert!(state.monitor_data.is_none());
         assert!(state.containers.is_empty());

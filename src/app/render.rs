@@ -189,7 +189,7 @@ struct RemoteRenderSnapshot {
 /// enough to memcpy a dozen Vecs, not long enough to block the refresh
 /// task in any meaningful way.
 fn snapshot_for_render(rh: &crate::remote_host::RemoteHost) -> RemoteRenderSnapshot {
-    let s = rh.state.lock().unwrap();
+    let s = rh.state.lock();
     let time_str = s
         .monitor_data
         .as_ref()
@@ -288,7 +288,7 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
                     .map(|(pid, _)| *pid);
 
                 {
-                    let mut s = rh.state.lock().unwrap();
+                    let mut s = rh.state.lock();
                     s.ui_state = ui_clone;
                     s.prev_selected_pid = current_pid;
                 }

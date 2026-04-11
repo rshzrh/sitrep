@@ -47,11 +47,26 @@ impl DockerClient {
     }
 
     /// Fetch CPU stats for all containers concurrently instead of sequentially.
+    ///
+    /// Wrapped in a global timeout so one wedged daemon call can't stall
+    /// the monitor update thread (and therefore the UI) indefinitely.
+    /// Each inner call already has its own 3s timeout; the outer 5s is a
+    /// backstop against a pathological daemon state where bollard itself
+    /// hangs before the per-call timer arms.
     pub async fn get_all_cpu_percents(&self, ids: &[String]) -> Vec<f64> {
         let futures: Vec<_> = ids.iter()
             .map(|id| self.get_cpu_percent(id))
             .collect();
-        join_all(futures).await
+        match tokio::time::timeout(Duration::from_secs(5), join_all(futures)).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::warn!(
+                    "get_all_cpu_percents: global 5s timeout hit for {} containers; returning zeros",
+                    ids.len()
+                );
+                vec![0.0; ids.len()]
+            }
+        }
     }
 
     /// Fetch a one-shot stats snapshot for a container. Returns cpu_percent.

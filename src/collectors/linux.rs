@@ -122,7 +122,10 @@ impl LinuxCollector {
     }
 
     fn socket_scan_ttl() -> std::time::Duration {
-        std::time::Duration::from_secs(1)
+        // Matches the default 5s tick. Scanning every PID's /proc/[pid]/fd
+        // on a 2k-process host at 1s TTL costs ~2k stat calls/sec; 5s
+        // aligns the cost with how often the user actually sees the data.
+        std::time::Duration::from_secs(5)
     }
 
     fn get_socket_scan(&self) -> (HashMap<u64, (u32, String)>, Vec<(u64, u8)>) {

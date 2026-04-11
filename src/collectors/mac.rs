@@ -5,16 +5,24 @@ use crate::model::{
 use sysinfo::Pid;
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 pub struct MacCollector {
     /// Cached nettop results, updated by a background thread every ~2 seconds.
     nettop_cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>>,
     command_cache: Mutex<MacCommandCache>,
     shutdown_flag: Arc<AtomicBool>,
+    /// Set to `false` when the System tab is not the active tab.
+    /// The nettop background loop checks this and skips spawning the
+    /// subprocess while the user is looking at another tab — the cached
+    /// numbers go stale but we stop burning a subprocess every 2s for
+    /// data nobody is reading.
+    active_flag: Arc<AtomicBool>,
 }
 
 struct MacCommandCache {
@@ -25,10 +33,18 @@ struct MacCommandCache {
 
 impl MacCollector {
     pub fn new() -> Self {
+        Self::new_with_active_flag(Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Construct with an externally-owned `active_flag`. Used by
+    /// `Monitor` so the App can toggle the flag even while the
+    /// collector has been moved into the background update thread.
+    pub fn new_with_active_flag(active_flag: Arc<AtomicBool>) -> Self {
         let cache: Arc<Mutex<HashMap<Pid, (u64, u64)>>> = Arc::new(Mutex::new(HashMap::new()));
         let cache_clone = Arc::clone(&cache);
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown_flag);
+        let active_clone = Arc::clone(&active_flag);
 
         // Spawn a background thread that continuously runs nettop and updates the cache.
         thread::spawn(move || {
@@ -36,10 +52,13 @@ impl MacCollector {
                 if shutdown_clone.load(Ordering::Acquire) {
                     break;
                 }
-                let stats = run_nettop();
-                if let Ok(mut guard) = cache_clone.lock() {
-                    *guard = stats;
+                if active_clone.load(Ordering::Acquire) {
+                    let stats = run_nettop();
+                    *cache_clone.lock() = stats;
                 }
+                // Sleep regardless — whether we ran nettop or not — so the
+                // loop stays on a predictable cadence and resumes cleanly
+                // when the user switches back to the System tab.
                 thread::sleep(Duration::from_secs(2));
             }
         });
@@ -52,6 +71,7 @@ impl MacCollector {
                 context_switches: None,
             }),
             shutdown_flag,
+            active_flag,
         }
     }
 
@@ -228,22 +248,26 @@ impl SystemCollector for MacCollector {
     }
 
     fn get_fd_stats(&self) -> FdInfo {
-        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.command_cache.lock();
         self.get_cached(&mut cache.fd_info, || self.compute_fd_stats())
     }
 
     fn get_socket_stats(&self) -> SocketOverviewInfo {
-        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.command_cache.lock();
         self.get_cached(&mut cache.socket_info, || self.compute_socket_stats())
     }
 
     fn get_context_switches(&self) -> ContextSwitchInfo {
-        let mut cache = self.command_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.command_cache.lock();
         self.get_cached(&mut cache.context_switches, || self.compute_context_switches())
     }
 
     fn get_process_network_stats(&mut self) -> HashMap<Pid, (u64, u64)> {
         // Read cached results from the background nettop thread — no blocking!
-        self.nettop_cache.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.nettop_cache.lock().clone()
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active_flag.store(active, Ordering::Release);
     }
 }

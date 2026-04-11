@@ -126,7 +126,7 @@ impl App {
                 Some(h) => h,
                 None => continue,
             };
-            let rh_state = rh.state.lock().unwrap();
+            let rh_state = rh.state.lock();
             use crate::collectors::remote::ConnState;
             let new_status = match rh_state.conn_state {
                 ConnState::Connected => crate::model::HostStatus::Up,
@@ -201,7 +201,7 @@ impl App {
             // Snapshot the multi-log container ids (under a brief lock)
             // so we know how to route lines for this tick.
             let multi_ids: Vec<String> = {
-                let s = rh.state.lock().unwrap();
+                let s = rh.state.lock();
                 s.multi_log_container_ids.clone()
             };
 
@@ -210,7 +210,7 @@ impl App {
                 if !multi_ids.is_empty() && multi_ids.contains(&line.stream_id) {
                     // Look up the container name for the prefix.
                     let name = {
-                        let s = rh.state.lock().unwrap();
+                        let s = rh.state.lock();
                         s.containers
                             .iter()
                             .find(|c| c.id == line.stream_id)
@@ -233,7 +233,7 @@ impl App {
                 }
 
                 // Route 2: single-container log.
-                let rh_state = rh.state.lock().unwrap();
+                let rh_state = rh.state.lock();
                 let is_container = rh_state.containers.iter().any(|c| c.id == line.stream_id);
                 drop(rh_state);
                 if is_container {
@@ -283,7 +283,7 @@ impl App {
                 continue;
             };
             while let Ok(result) = rx.try_recv() {
-                let mut s = rh.state.lock().unwrap();
+                let mut s = rh.state.lock();
                 let prefix = if result.success { "OK" } else { "FAIL" };
                 s.status_message = Some(format!(
                     "[{}] {} {}: {}",

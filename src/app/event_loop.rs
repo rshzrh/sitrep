@@ -121,6 +121,13 @@ impl App {
     pub fn refresh_on_tab_switch(&mut self) -> bool {
         let now = Instant::now();
         if self.app_view != self.prev_app_view {
+            // Gate expensive background collectors on whether their tab
+            // is the active view. Currently only the macOS `nettop` loop
+            // listens to this, but the flag lives on every Monitor so
+            // future collectors can opt in for free.
+            let system_active = matches!(self.app_view, AppView::System);
+            self.monitor.set_active(system_active);
+
             let since_last = now.duration_since(self.last_tab_refresh);
             if since_last >= self.min_refresh_interval {
                 match &self.app_view {

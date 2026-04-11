@@ -4,6 +4,8 @@ mod process;
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
@@ -24,6 +26,13 @@ pub struct Monitor {
     pub last_data: Option<MonitorData>,
     worker_state: Option<MonitorWorkerState>,
     update_receiver: Option<mpsc::Receiver<MonitorUpdateResult>>,
+    /// Shared flag telling the collector whether the System tab is the
+    /// active (user-visible) tab. The MacCollector's background nettop
+    /// loop reads this and pauses its subprocess spawn loop when the
+    /// user has switched away. Held as an Arc so it stays reachable
+    /// even while `worker_state` is moved into the background update
+    /// thread.
+    active_flag: Arc<AtomicBool>,
 }
 
 struct MonitorWorkerState {
@@ -49,8 +58,11 @@ impl Monitor {
         let disks = Disks::new_with_refreshed_list();
         let networks = Networks::new_with_refreshed_list();
 
+        // Start active — System is the default tab on launch.
+        let active_flag = Arc::new(AtomicBool::new(true));
+
         let collector: Box<dyn SystemCollector> = if cfg!(target_os = "macos") {
-            Box::new(MacCollector::new())
+            Box::new(MacCollector::new_with_active_flag(Arc::clone(&active_flag)))
         } else {
             Box::new(LinuxCollector::new())
         };
@@ -69,6 +81,7 @@ impl Monitor {
                 collector,
             }),
             update_receiver: None,
+            active_flag,
         }
     }
 
@@ -89,6 +102,15 @@ impl Monitor {
         });
 
         self.update_receiver = Some(rx);
+    }
+
+    /// Tell the collector whether the System tab is active. Collectors
+    /// with expensive background work (macOS `nettop`) use this to pause
+    /// that work while the user is looking at another tab. The flag is
+    /// an `Arc<AtomicBool>` shared with the collector, so this call
+    /// lands even while a background update is in flight.
+    pub fn set_active(&self, active: bool) {
+        self.active_flag.store(active, Ordering::Release);
     }
 
     pub fn poll_update(&mut self) -> bool {

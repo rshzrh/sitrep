@@ -240,7 +240,7 @@ fn handle_remote(app: &mut App, code: KeyCode) -> Option<InputResult> {
                         for (id, _) in pairs {
                             rh.stop_log_stream(id);
                         }
-                        let mut s = rh.state.lock().unwrap();
+                        let mut s = rh.state.lock();
                         s.multi_log_container_ids.clear();
                     }
                     app.remote_multi_logs.remove(&host_idx);
@@ -329,7 +329,7 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
 
     match code {
         Up => {
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             if s.ui_state.selected_index > 0 {
                 s.ui_state.selected_index -= 1;
                 return Some(InputResult::Consumed);
@@ -337,7 +337,7 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
             None
         }
         Down => {
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             if s.ui_state.selected_index + 1 < s.ui_state.total_rows {
                 s.ui_state.selected_index += 1;
                 return Some(InputResult::Consumed);
@@ -351,7 +351,7 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
             // confusingly triggers the "frozen" warning. Section headers
             // still toggle because they're layout state, not data.
             let row_mapping = app.remote_row_mappings.get(&host_idx)?.clone();
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             let idx = s.ui_state.selected_index;
             if idx < row_mapping.len() {
                 let (_pid, kind) = row_mapping[idx];
@@ -369,7 +369,7 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
             // Left: collapse an expanded section header. ProcessParent /
             // ProcessChild collapse is disabled on remote (no children).
             let row_mapping = app.remote_row_mappings.get(&host_idx)?.clone();
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             let idx = s.ui_state.selected_index;
             if idx < row_mapping.len() {
                 let (_pid, kind) = row_mapping[idx];
@@ -383,27 +383,27 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
             None
         }
         Char('c') => {
-            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Cpu;
+            rh.state.lock().ui_state.sort_column = SortColumn::Cpu;
             Some(InputResult::Consumed)
         }
         Char('m') => {
-            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Memory;
+            rh.state.lock().ui_state.sort_column = SortColumn::Memory;
             Some(InputResult::Consumed)
         }
         Char('r') => {
-            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Read;
+            rh.state.lock().ui_state.sort_column = SortColumn::Read;
             Some(InputResult::Consumed)
         }
         Char('w') => {
-            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::Write;
+            rh.state.lock().ui_state.sort_column = SortColumn::Write;
             Some(InputResult::Consumed)
         }
         Char('d') => {
-            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::NetDown;
+            rh.state.lock().ui_state.sort_column = SortColumn::NetDown;
             Some(InputResult::Consumed)
         }
         Char('u') => {
-            rh.state.lock().unwrap().ui_state.sort_column = SortColumn::NetUp;
+            rh.state.lock().ui_state.sort_column = SortColumn::NetUp;
             Some(InputResult::Consumed)
         }
         _ => None,
@@ -421,7 +421,7 @@ fn handle_remote_containers(
     let rh = app.remote_hosts.get(host_idx)?;
     match code {
         Up => {
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             if s.container_ui.selected_index > 0 {
                 s.container_ui.selected_index -= 1;
                 s.container_ui.selected_id = s
@@ -433,7 +433,7 @@ fn handle_remote_containers(
             Some(InputResult::Consumed)
         }
         Down => {
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             let max = s.containers.len().saturating_sub(1);
             if s.container_ui.selected_index < max {
                 s.container_ui.selected_index += 1;
@@ -447,7 +447,7 @@ fn handle_remote_containers(
         }
         Right => {
             // Open log view for the selected container.
-            let s = rh.state.lock().unwrap();
+            let s = rh.state.lock();
             let idx = s.container_ui.selected_index;
             let container_id = s.containers.get(idx).map(|c| c.id.clone());
             drop(s);
@@ -463,7 +463,7 @@ fn handle_remote_containers(
         }
         Left => {
             // Toggle expand/collapse of the selected container's details.
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             let idx = s.container_ui.selected_index;
             if let Some(c) = s.containers.get(idx).cloned() {
                 if s.container_ui.expanded_ids.contains(&c.id) {
@@ -476,7 +476,7 @@ fn handle_remote_containers(
         }
         Char(' ') => {
             // Toggle multi-select marker on the selected container.
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             let idx = s.container_ui.selected_index;
             if let Some(c) = s.containers.get(idx).cloned() {
                 if s.container_ui.selected_containers.contains(&c.id) {
@@ -489,7 +489,7 @@ fn handle_remote_containers(
         }
         Char('l') | Char('L') => {
             // Open a multi-container log view for all selected containers.
-            let s = rh.state.lock().unwrap();
+            let s = rh.state.lock();
             let selected: Vec<(String, String)> = s
                 .containers
                 .iter()
@@ -508,7 +508,7 @@ fn handle_remote_containers(
                 // log-poll routine routes their lines into the multi-log
                 // state instead of the per-container state.
                 {
-                    let mut s2 = rh.state.lock().unwrap();
+                    let mut s2 = rh.state.lock();
                     s2.multi_log_container_ids = ids;
                 }
                 app.app_view = AppView::Remote {
@@ -525,7 +525,7 @@ fn handle_remote_containers(
         // top of handle_key routes the confirmed action to
         // RemoteHost::run_action over SSH.
         Char('S') | Char('T') | Char('R') => {
-            let s = rh.state.lock().unwrap();
+            let s = rh.state.lock();
             let idx = s.container_ui.selected_index;
             let container = s.containers.get(idx).cloned();
             drop(s);
@@ -709,14 +709,14 @@ fn handle_remote_swarm(app: &mut App, host_idx: usize, code: KeyCode) -> Option<
     let rh = app.remote_hosts.get(host_idx)?;
     match code {
         Up => {
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             if s.swarm_ui.selected_index > 0 {
                 s.swarm_ui.selected_index -= 1;
             }
             Some(InputResult::Consumed)
         }
         Down => {
-            let mut s = rh.state.lock().unwrap();
+            let mut s = rh.state.lock();
             // Upper bound is the overview row count — use service count
             // as a safe approximation since we don't track row mapping
             // separately for the remote swarm view.
@@ -728,7 +728,7 @@ fn handle_remote_swarm(app: &mut App, host_idx: usize, code: KeyCode) -> Option<
         }
         Char('R') => {
             // Rolling-restart with confirmation.
-            let s = rh.state.lock().unwrap();
+            let s = rh.state.lock();
             let idx = s.swarm_ui.selected_index.min(s.swarm_services.len().saturating_sub(1));
             let svc = s.swarm_services.get(idx).cloned();
             drop(s);
@@ -751,7 +751,7 @@ fn handle_remote_swarm(app: &mut App, host_idx: usize, code: KeyCode) -> Option<
         }
         Right | Enter => {
             // Drill into the selected service's tasks.
-            let s = rh.state.lock().unwrap();
+            let s = rh.state.lock();
             let idx = s.swarm_ui.selected_index.min(s.swarm_services.len().saturating_sub(1));
             let svc = s.swarm_services.get(idx).cloned();
             drop(s);

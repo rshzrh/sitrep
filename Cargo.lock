@@ -750,6 +750,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "insta",
+ "parking_lot",
  "russh",
  "russh-keys",
  "serde",
