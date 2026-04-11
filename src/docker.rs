@@ -1,9 +1,10 @@
 use bollard::Docker;
-use bollard::container::{
-    ListContainersOptions, StatsOptions, LogsOptions, LogOutput, Stats,
-    StopContainerOptions, RestartContainerOptions,
+use bollard::container::LogOutput;
+use bollard::models::{ContainerStatsResponse, ContainerSummary};
+use bollard::query_parameters::{
+    ListContainersOptionsBuilder, LogsOptionsBuilder, RestartContainerOptionsBuilder,
+    StatsOptionsBuilder, StopContainerOptionsBuilder,
 };
-use bollard::models::ContainerSummary;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use std::time::Duration;
@@ -31,10 +32,10 @@ impl DockerClient {
 
     /// List running containers and map them to our model type.
     pub async fn list_containers(&self) -> Result<Vec<DockerContainerInfo>, String> {
-        let options: ListContainersOptions<String> = ListContainersOptions {
-            all: false, // only running
-            ..Default::default()
-        };
+        // bollard 0.20 moved the options structs to `query_parameters`
+        // and exposes them via builder types instead of direct struct
+        // literals. Default = "only running" (all = false).
+        let options = ListContainersOptionsBuilder::default().all(false).build();
 
         let summaries = self.client.list_containers(Some(options)).await
             .map_err(|e| format!("Failed to list containers: {}", e))?;
@@ -71,12 +72,12 @@ impl DockerClient {
 
     /// Fetch a one-shot stats snapshot for a container. Returns cpu_percent.
     pub async fn get_cpu_percent(&self, container_id: &str) -> f64 {
-        let options = StatsOptions {
-            stream: false,
-            one_shot: true,
-        };
+        let options = StatsOptionsBuilder::default()
+            .stream(false)
+            .one_shot(true)
+            .build();
 
-        let mut stream = self.client.stats(container_id, Some(options));
+        let mut stream = Box::pin(self.client.stats(container_id, Some(options)));
         match tokio::time::timeout(Duration::from_secs(3), stream.next()).await {
             Ok(Some(Ok(stats))) => calculate_cpu_percent(&stats),
             _ => 0.0,
@@ -92,14 +93,13 @@ impl DockerClient {
     ) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel::<String>(256);
 
-        let options: LogsOptions<String> = LogsOptions {
-            stdout: true,
-            stderr: true,
-            follow: true,
-            tail: "200".to_string(),
-            timestamps: true,
-            ..Default::default()
-        };
+        let options = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(true)
+            .follow(true)
+            .tail("200")
+            .timestamps(true)
+            .build();
 
         let stream = self.client.logs(container_id, Some(options));
 
@@ -134,14 +134,14 @@ impl DockerClient {
     /// Start a stopped container.
     pub async fn start_container(&self, container_id: &str) -> Result<(), String> {
         self.client
-            .start_container::<String>(container_id, None)
+            .start_container(container_id, None)
             .await
             .map_err(|e| e.to_string())
     }
 
     /// Stop a running container.
     pub async fn stop_container(&self, container_id: &str) -> Result<(), String> {
-        let options = StopContainerOptions { t: 10 };
+        let options = StopContainerOptionsBuilder::default().t(10).build();
         self.client
             .stop_container(container_id, Some(options))
             .await
@@ -150,7 +150,7 @@ impl DockerClient {
 
     /// Restart a container.
     pub async fn restart_container(&self, container_id: &str) -> Result<(), String> {
-        let options = RestartContainerOptions { t: 10 };
+        let options = RestartContainerOptionsBuilder::default().t(10).build();
         self.client
             .restart_container(container_id, Some(options))
             .await
@@ -170,7 +170,11 @@ impl DockerClient {
 
         let image = s.image.clone().unwrap_or_default();
 
-        let state = s.state.clone().unwrap_or_default();
+        // bollard 0.20 changed `state` from Option<String> to
+        // Option<ContainerSummaryStateEnum>. The enum has a Display
+        // impl matching the original string form ("running", "exited",
+        // etc.), so `.to_string()` preserves the on-wire value.
+        let state = s.state.map(|e| e.to_string()).unwrap_or_default();
         let status = s.status.clone().unwrap_or_default();
 
         let uptime = format_uptime(s.created.unwrap_or(0));
@@ -195,12 +199,23 @@ impl DockerClient {
 
 // --- Free helper functions ---
 
-fn calculate_cpu_percent(stats: &Stats) -> f64 {
-    let cpu_stats = &stats.cpu_stats;
-    let precpu_stats = &stats.precpu_stats;
-
-    let cpu_delta = cpu_stats.cpu_usage.total_usage as f64
-        - precpu_stats.cpu_usage.total_usage as f64;
+fn calculate_cpu_percent(stats: &ContainerStatsResponse) -> f64 {
+    // bollard 0.20 wraps every sub-struct in `Option`, so we need a
+    // stack of `?`s to get at the actual numbers. Any missing field
+    // means the container isn't reporting full stats — return 0.0.
+    let Some(cpu_stats) = stats.cpu_stats.as_ref() else {
+        return 0.0;
+    };
+    let Some(precpu_stats) = stats.precpu_stats.as_ref() else {
+        return 0.0;
+    };
+    let cpu_total = cpu_stats.cpu_usage.as_ref().and_then(|u| u.total_usage).unwrap_or(0) as f64;
+    let precpu_total = precpu_stats
+        .cpu_usage
+        .as_ref()
+        .and_then(|u| u.total_usage)
+        .unwrap_or(0) as f64;
+    let cpu_delta = cpu_total - precpu_total;
     let system_delta = cpu_stats.system_cpu_usage.unwrap_or(0) as f64
         - precpu_stats.system_cpu_usage.unwrap_or(0) as f64;
 

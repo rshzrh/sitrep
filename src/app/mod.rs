@@ -63,9 +63,10 @@ impl App {
         let tick_rate = Duration::from_secs(tick_rate_secs);
 
         let monitor_handle = std::thread::spawn(Monitor::new);
-        let swarm_handle = std::thread::spawn(SwarmMonitor::new);
-        let rt_clone = Arc::clone(&rt);
-        let docker_handle = std::thread::spawn(move || DockerMonitor::new(rt_clone, no_docker));
+        let rt_swarm = Arc::clone(&rt);
+        let swarm_handle = std::thread::spawn(move || SwarmMonitor::new(rt_swarm));
+        let rt_docker = Arc::clone(&rt);
+        let docker_handle = std::thread::spawn(move || DockerMonitor::new(rt_docker, no_docker));
 
         let monitor = monitor_handle.join().expect("Monitor init panicked");
         let docker_monitor = docker_handle.join().expect("DockerMonitor init panicked");

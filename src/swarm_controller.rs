@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+
+use bollard::Docker;
 
 use crate::model::{
     SwarmMode, SwarmClusterInfo, SwarmNodeInfo, SwarmServiceInfo,
@@ -11,6 +14,14 @@ use crate::swarm;
 use crate::swarm::LogStreamHandle;
 
 /// Manages Docker Swarm data collection, state, and actions.
+///
+/// As of the A4 refactor (eng review block 4), all swarm reads go
+/// through bollard instead of shelling out to the `docker` CLI. The
+/// bollard client is `async`, so each public sync method here calls
+/// `rt.block_on(swarm::some_async_fn(&client, ...))`. The client
+/// is cached for the life of the monitor; if it fails to connect
+/// at construction time we fall back to standalone mode and report
+/// the error via `status_message`.
 pub struct SwarmMonitor {
     pub mode: SwarmMode,
     pub cluster_info: Option<SwarmClusterInfo>,
@@ -25,7 +36,11 @@ pub struct SwarmMonitor {
     log_handle: Option<LogStreamHandle>,
     pub status_message: Option<String>,
     pub warnings: Vec<String>,
-    pub docker_cli_available: bool,
+    /// Tokio runtime shared with DockerMonitor / App. Used to
+    /// `block_on` the async bollard calls from the sync tick loop.
+    rt: Arc<tokio::runtime::Runtime>,
+    /// Cached bollard client. `None` if the daemon isn't reachable.
+    client: Option<Docker>,
     /// Receiver for background action results (rolling restart, scale).
     action_receiver: Option<mpsc::Receiver<Result<String, String>>>,
     /// True while a background action is in flight.
@@ -33,10 +48,22 @@ pub struct SwarmMonitor {
 }
 
 impl SwarmMonitor {
-    pub fn new() -> Self {
-        let docker_cli_available = swarm::is_docker_cli_available();
-        let cluster_info = if docker_cli_available {
-            swarm::detect_swarm()
+    pub fn new(rt: Arc<tokio::runtime::Runtime>) -> Self {
+        // Try to connect bollard to the local daemon. If that fails,
+        // the caller sees `mode == Standalone` and `client == None`
+        // and all swarm calls will short-circuit.
+        let client = Docker::connect_with_local_defaults().ok();
+        let reachable = client
+            .as_ref()
+            .map(|c| rt.block_on(swarm::is_docker_available(c)))
+            .unwrap_or(false);
+
+        let cluster_info = if reachable {
+            if let Some(ref c) = client {
+                rt.block_on(swarm::detect_swarm(c))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -59,7 +86,8 @@ impl SwarmMonitor {
             log_handle: None,
             status_message: None,
             warnings: Vec::new(),
-            docker_cli_available,
+            rt,
+            client: if reachable { client } else { None },
             action_receiver: None,
             action_in_progress: false,
         }
@@ -75,6 +103,12 @@ impl SwarmMonitor {
     ) -> Self {
         let mut ui_state = SwarmUIState::default();
         ui_state.expanded_ids = expanded_ids;
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime"),
+        );
         Self {
             mode: SwarmMode::Swarm,
             cluster_info: None,
@@ -88,7 +122,8 @@ impl SwarmMonitor {
             log_handle: None,
             status_message: None,
             warnings: Vec::new(),
-            docker_cli_available: false,
+            rt,
+            client: None,
             action_receiver: None,
             action_in_progress: false,
         }
@@ -103,11 +138,18 @@ impl SwarmMonitor {
         if self.is_swarm() {
             return;
         }
-        self.docker_cli_available = swarm::is_docker_cli_available();
-        if !self.docker_cli_available {
+        // Re-attempt connection if we don't have a client yet. The
+        // daemon may have been started after flotop launched.
+        if self.client.is_none() {
+            self.client = Docker::connect_with_local_defaults().ok();
+        }
+        let Some(ref client) = self.client else {
+            return;
+        };
+        if !self.rt.block_on(swarm::is_docker_available(client)) {
             return;
         }
-        self.cluster_info = swarm::detect_swarm();
+        self.cluster_info = self.rt.block_on(swarm::detect_swarm(client));
         if self.cluster_info.is_some() {
             self.mode = SwarmMode::Swarm;
         }
@@ -118,13 +160,29 @@ impl SwarmMonitor {
         if !self.is_swarm() {
             return;
         }
+        // `Docker` is Clone (it's an Arc around the inner HTTP client),
+        // so cloning here gives us a self-contained handle that
+        // doesn't hold a borrow on `self`. Cheap.
+        let Some(client) = self.client.clone() else {
+            return;
+        };
 
-        match swarm::list_nodes() {
+        // Snapshot the manager node id so we can re-compute the
+        // `is_self` flag after each nodes fetch (bollard doesn't
+        // expose it per-node).
+        let self_node_id = self
+            .cluster_info
+            .as_ref()
+            .map(|ci| ci.node_id.clone())
+            .unwrap_or_default();
+
+        match self.rt.block_on(swarm::list_nodes(&client)) {
             Ok(mut nodes) => {
-                let ips = swarm::batch_get_node_ips(&nodes);
-                for node in &mut nodes {
-                    if let Some(ip) = ips.get(&node.id) {
-                        node.ip_address = ip.clone();
+                if !self_node_id.is_empty() {
+                    for n in &mut nodes {
+                        if n.id == self_node_id {
+                            n.is_self = true;
+                        }
                     }
                 }
                 self.nodes = nodes;
@@ -135,7 +193,7 @@ impl SwarmMonitor {
             }
         }
 
-        match swarm::list_services() {
+        match self.rt.block_on(swarm::list_services(&client)) {
             Ok(services) => {
                 self.services = services;
                 self.build_stacks();
@@ -148,7 +206,7 @@ impl SwarmMonitor {
 
         // Refresh tasks if we're in task view
         if let SwarmViewLevel::ServiceTasks(ref svc_id, _) = self.ui_state.view_level {
-            match swarm::list_service_tasks(svc_id) {
+            match self.rt.block_on(swarm::list_service_tasks(&client, svc_id)) {
                 Ok(tasks) => self.tasks = tasks,
                 Err(e) => {
                     tracing::warn!("Swarm task list failed: {}", e);
@@ -174,7 +232,7 @@ impl SwarmMonitor {
 
             if !svc_ids.is_empty() {
                 let id_refs: Vec<&str> = svc_ids.iter().map(|s| s.as_str()).collect();
-                match swarm::list_tasks_for_services(&id_refs) {
+                match self.rt.block_on(swarm::list_tasks_for_services(&client, &id_refs)) {
                     Ok(tasks) => {
                         // Build a name->id lookup from services
                         let name_to_id: HashMap<String, String> = self.services.iter()
@@ -221,9 +279,9 @@ impl SwarmMonitor {
     /// get the same warnings.
     fn generate_warnings(&mut self) {
         self.warnings.clear();
-        if !self.docker_cli_available {
+        if self.client.is_none() {
             self.warnings
-                .push("docker CLI not found in PATH — Swarm data unavailable".to_string());
+                .push("docker daemon not reachable — Swarm data unavailable".to_string());
             return;
         }
         self.warnings = crate::swarm_helpers::compute_warnings(
@@ -253,11 +311,13 @@ impl SwarmMonitor {
 
     /// Enter task view for a specific service.
     pub fn enter_task_view(&mut self, service_id: &str, service_name: &str) {
-        match swarm::list_service_tasks(service_id) {
-            Ok(tasks) => self.tasks = tasks,
-            Err(e) => {
-                self.tasks.clear();
-                self.status_message = Some(format!("Error: {}", e));
+        if let Some(ref client) = self.client {
+            match self.rt.block_on(swarm::list_service_tasks(client, service_id)) {
+                Ok(tasks) => self.tasks = tasks,
+                Err(e) => {
+                    self.tasks.clear();
+                    self.status_message = Some(format!("Error: {}", e));
+                }
             }
         }
         self.ui_state.view_level = SwarmViewLevel::ServiceTasks(
@@ -272,7 +332,8 @@ impl SwarmMonitor {
         // Kill any existing log stream first
         self.stop_log_stream();
 
-        let handle = swarm::tail_service_logs(service_id);
+        let Some(ref client) = self.client else { return };
+        let handle = swarm::tail_service_logs(client, self.rt.handle(), service_id);
         self.log_state = Some(ServiceLogState::new(
             service_id.to_string(),
             service_name.to_string(),
@@ -295,16 +356,17 @@ impl SwarmMonitor {
 
     /// Drain pending log lines from the channel.
     pub fn poll_logs(&mut self) {
-        let Some(ref handle) = self.log_handle else { return };
+        let Some(ref mut handle) = self.log_handle else { return };
         let Some(ref mut log_state) = self.log_state else { return };
 
+        use tokio::sync::mpsc::error::TryRecvError;
         for _ in 0..200 {
             match handle.receiver.try_recv() {
                 Ok(line) => {
                     log_state.push_line(line);
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     log_state.push_line("[log stream ended]".to_string());
                     break;
                 }
@@ -326,11 +388,22 @@ impl SwarmMonitor {
         self.action_in_progress = true;
         self.status_message = Some(format!("Rolling restart in progress for {}...", service_id));
 
+        // Spawn a fresh bollard client on the worker thread — Docker
+        // clients are cheap to create (just an Arc around the HTTP
+        // client) and moving the cached one across threads is fine
+        // but less self-contained.
+        let rt = Arc::clone(&self.rt);
         thread::spawn(move || {
-            let result = match swarm::force_update_service(&id) {
-                Ok(()) => Ok(format!("Rolling restart initiated for {}", id)),
-                Err(e) => Err(format!("Error: {}", e.trim())),
-            };
+            let result = rt.block_on(async {
+                let client = match Docker::connect_with_local_defaults() {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("Error: {}", e)),
+                };
+                match swarm::force_update_service(&client, &id).await {
+                    Ok(()) => Ok(format!("Rolling restart initiated for {}", id)),
+                    Err(e) => Err(format!("Error: {}", e.trim())),
+                }
+            });
             let _ = tx.send(result);
         });
     }
@@ -348,11 +421,18 @@ impl SwarmMonitor {
         self.action_in_progress = true;
         self.status_message = Some(format!("Scaling {} to {} replicas...", service_id, replicas));
 
+        let rt = Arc::clone(&self.rt);
         thread::spawn(move || {
-            let result = match swarm::scale_service(&id, replicas) {
-                Ok(()) => Ok(format!("Scaled {} to {} replicas", id, replicas)),
-                Err(e) => Err(format!("Error: {}", e.trim())),
-            };
+            let result = rt.block_on(async {
+                let client = match Docker::connect_with_local_defaults() {
+                    Ok(c) => c,
+                    Err(e) => return Err(format!("Error: {}", e)),
+                };
+                match swarm::scale_service(&client, &id, replicas).await {
+                    Ok(()) => Ok(format!("Scaled {} to {} replicas", id, replicas)),
+                    Err(e) => Err(format!("Error: {}", e.trim())),
+                }
+            });
             let _ = tx.send(result);
         });
     }

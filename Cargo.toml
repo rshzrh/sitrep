@@ -22,7 +22,7 @@ path = "src/main.rs"
 chrono = "0.4.43"
 crossterm = "0.29.0"
 sysinfo = "0.38.1"
-bollard = "0.18"
+bollard = "0.20"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
