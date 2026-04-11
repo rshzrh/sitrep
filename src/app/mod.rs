@@ -314,6 +314,13 @@ pub fn run(should_quit: Arc<AtomicBool>, cli: &crate::cli::Cli) -> io::Result<()
 
     let mut app = App::new(Arc::clone(&rt), cli.refresh_rate, cli.no_docker);
 
+    // Kick off the first System-tab update immediately, before the
+    // main loop enters `process_tick`. The worker thread then overlaps
+    // with fleet setup + the splash→main-loop transition instead of
+    // running serially after them. Idempotent: `Monitor::update` is a
+    // no-op if an update is already in flight.
+    app.monitor.update();
+
     // ── multi-host mode: spawn per-host orchestrators + show fleet overview ──
     if !cli.hosts.is_empty() {
         let display_names: Vec<String> = cli.hosts.clone();

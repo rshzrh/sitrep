@@ -101,12 +101,22 @@ impl MacCollector {
                         break;
                     }
                     if active_clone.load(Ordering::Acquire) {
-                        // Compute OUTSIDE the lock — these subprocess
-                        // calls can take multiple seconds and we don't
-                        // want to block the render path that long.
-                        let fd = compute_fd_stats();
-                        let sk = compute_socket_stats();
-                        let cs = compute_context_switches();
+                        // Run the three compute calls concurrently via
+                        // a scoped thread pool. On a Mac with sluggish
+                        // `netstat`/`ps` these are all independent I/O
+                        // bound work — sequential is sum, parallel is
+                        // max. Compute OUTSIDE the lock so we never
+                        // block the render path on a subprocess.
+                        let (fd, sk, cs) = thread::scope(|s| {
+                            let fd_h = s.spawn(compute_fd_stats);
+                            let sk_h = s.spawn(compute_socket_stats);
+                            let cs_h = s.spawn(compute_context_switches);
+                            (
+                                fd_h.join().unwrap_or_default(),
+                                sk_h.join().unwrap_or_default(),
+                                cs_h.join().unwrap_or_default(),
+                            )
+                        });
                         let mut cache = cache_clone.lock();
                         cache.fd_info = Some(fd);
                         cache.socket_info = Some(sk);
@@ -132,6 +142,11 @@ fn parse_sysctl_value(output: &str) -> u64 {
 }
 
 fn compute_fd_stats() -> FdInfo {
+    // Only the `system_used` / `system_max` totals are ever rendered —
+    // no view reads `FdInfo::top_processes`. The previous implementation
+    // ran `lsof -n -P | awk ...` to populate that field, which took
+    // 2–3 seconds on a busy Mac and then produced data nobody looked
+    // at. Dropped; totals come from sysctl which is ~1ms.
     let mut info = FdInfo::default();
 
     if let Ok(output) = Command::new("sysctl").arg("kern.num_files").output() {
@@ -145,23 +160,15 @@ fn compute_fd_stats() -> FdInfo {
         }
     }
 
-    let cmd = "lsof -n -P | awk '{print $1}' | sort | uniq -c | sort -nr | head -5";
-    if let Ok(output) = Command::new("sh").arg("-c").arg(cmd).output() {
-        let out_str = String::from_utf8_lossy(&output.stdout);
-        for line in out_str.lines() {
-             let parts: Vec<&str> = line.trim().split_whitespace().collect();
-             if parts.len() >= 2 {
-                 let count: u64 = parts[0].parse().unwrap_or(0);
-                 let name = parts[1].to_string();
-                 info.top_processes.push((name, count));
-             }
-        }
-    }
-
     info
 }
 
 fn compute_socket_stats() -> SocketOverviewInfo {
+    // Only the state-count totals (EST/LISTEN/TW/CW/FW) are ever
+    // rendered — no view reads `SocketOverviewInfo::top_processes`.
+    // The previous implementation ran `lsof -i -n -P` to populate that
+    // field, which took 2–3 seconds and produced dead data. Dropped;
+    // totals come from `netstat` in ~200ms.
     let mut established = 0u32;
     let mut listen = 0u32;
     let mut time_wait = 0u32;
@@ -169,37 +176,26 @@ fn compute_socket_stats() -> SocketOverviewInfo {
     let mut fin_wait = 0u32;
 
     if let Ok(output) = Command::new("netstat").args(["-an", "-p", "tcp"]).output() {
-        if !output.status.success() {
-            return SocketOverviewInfo { established, listen, time_wait, close_wait, fin_wait, top_processes: Vec::new() };
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            if line.contains("ESTABLISHED") { established += 1; }
-            else if line.contains("LISTEN") { listen += 1; }
-            else if line.contains("TIME_WAIT") { time_wait += 1; }
-            else if line.contains("CLOSE_WAIT") { close_wait += 1; }
-            else if line.contains("FIN_WAIT") { fin_wait += 1; }
-        }
-    }
-
-    let mut process_conns: HashMap<String, u32> = HashMap::new();
-    if let Ok(output) = Command::new("lsof").args(["-i", "-n", "-P"]).output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines().skip(1) {
-             if line.contains("ESTABLISHED") || line.contains("CLOSE_WAIT") || line.contains("LISTEN") {
-                 let parts: Vec<&str> = line.split_whitespace().collect();
-                 if let Some(name) = parts.first() {
-                     *process_conns.entry(name.to_string()).or_insert(0) += 1;
-                 }
-             }
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains("ESTABLISHED") { established += 1; }
+                else if line.contains("LISTEN") { listen += 1; }
+                else if line.contains("TIME_WAIT") { time_wait += 1; }
+                else if line.contains("CLOSE_WAIT") { close_wait += 1; }
+                else if line.contains("FIN_WAIT") { fin_wait += 1; }
+            }
         }
     }
 
-    let mut top_processes: Vec<(String, u32)> = process_conns.into_iter().collect();
-    top_processes.sort_by(|a, b| b.1.cmp(&a.1));
-    top_processes.truncate(5);
-
-    SocketOverviewInfo { established, listen, time_wait, close_wait, fin_wait, top_processes }
+    SocketOverviewInfo {
+        established,
+        listen,
+        time_wait,
+        close_wait,
+        fin_wait,
+        top_processes: Vec::new(),
+    }
 }
 
 fn compute_context_switches() -> ContextSwitchInfo {
