@@ -23,10 +23,12 @@ use crate::collectors::remote::{
 };
 use crate::layout::Layout;
 use crate::model::{
-    ContainerUIState, DockerContainerInfo, MonitorData, SwarmClusterInfo, SwarmNodeInfo,
-    SwarmServiceInfo, SwarmStackInfo, SwarmTaskInfo, SwarmUIState, UIState,
+    ContainerUIState, DockerContainerInfo, LogViewState, MonitorData, MultiLogViewState,
+    ServiceLogState, SwarmClusterInfo, SwarmNodeInfo, SwarmServiceInfo, SwarmStackInfo,
+    SwarmTaskInfo, SwarmUIState, UIState,
 };
 use crate::remote_docker::{run_remote_command, shell_escape_id};
+use crate::view::RowKind;
 use russh::keys::load_secret_key;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -145,6 +147,33 @@ pub struct RemoteHost {
 
     /// Refresh task handle (so App::drop can abort it if needed).
     refresh_task: Option<AbortHandle>,
+
+    // ── Per-host UI state ────────────────────────────────────────
+    //
+    // These used to live as parallel HashMaps on `App` keyed by
+    // host index. Moving them onto `RemoteHost` itself means:
+    //   (a) dropping a host cleans up its UI state automatically
+    //       (no HashMap leaks on host removal)
+    //   (b) the double-borrow gymnastics in `poll_remote_logs`
+    //       (iter_mut over remote_hosts while also accessing
+    //       per-host HashMaps on self) go away — the state is
+    //       reached through the same mutable borrow as the host.
+    //
+    // See A3 + A8 in the eng review. `LogViewState` was previously
+    // non-Send because it held a `RefCell` search cache; that
+    // RefCell was replaced with `parking_lot::Mutex` so these
+    // types are now Send and can live on RemoteHost freely.
+    /// Active per-container log streams, keyed by stream id
+    /// (container id or service id).
+    pub log_states: HashMap<String, LogViewState>,
+    /// Active service log, if any. One active at a time per host.
+    pub service_log: Option<ServiceLogState>,
+    /// Active multi-container log view, if any.
+    pub multi_log: Option<MultiLogViewState>,
+    /// Row mapping produced by `Presenter::render` for the remote
+    /// System tab. Used by `handle_remote_system` to resolve
+    /// Up/Down/Left/Right into section toggles.
+    pub row_mapping: Vec<(sysinfo::Pid, RowKind)>,
 }
 
 impl RemoteHost {
@@ -162,6 +191,10 @@ impl RemoteHost {
             action_tx,
             action_rx: Some(action_rx),
             refresh_task: None,
+            log_states: HashMap::new(),
+            service_log: None,
+            multi_log: None,
+            row_mapping: Vec::new(),
         }
     }
 

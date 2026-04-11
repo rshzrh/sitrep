@@ -1,10 +1,35 @@
 use std::time::Instant;
 
-use crate::model::AppView;
+use crate::controller::DataMonitor;
+use crate::model::{AppView, TabKind};
 
 use super::App;
 
 impl App {
+    /// Kick the background refresh for whichever monitor is backing
+    /// the current top-level tab. Single source of truth for the
+    /// "which monitor does this tab use" mapping — both `process_tick`
+    /// and `refresh_on_tab_switch` call this. Adding a 4th monitor
+    /// means adding one match arm here plus a `TabKind` variant.
+    fn dispatch_active_update(&mut self) {
+        let mon: Option<&mut dyn DataMonitor> = match self.app_view.tab_kind() {
+            TabKind::System => Some(&mut self.monitor),
+            TabKind::Containers => Some(&mut self.docker_monitor),
+            TabKind::Swarm => Some(&mut self.swarm_monitor),
+            TabKind::Fleet | TabKind::Remote => {
+                // Fleet refreshes are driven by per-host tokio tasks
+                // via mpsc; poll_fleet() / poll_remote_* drain those
+                // updates each tick. The SSH I/O runs in the background.
+                None
+            }
+        };
+        if let Some(mon) = mon {
+            if mon.is_available() {
+                mon.update();
+            }
+        }
+    }
+
     /// Process tick-based data refresh (every 3 seconds).
     pub fn process_tick(&mut self) -> bool {
         let now = Instant::now();
@@ -13,27 +38,7 @@ impl App {
         }
 
         self.tick_counter += 1;
-
-        match &self.app_view {
-            AppView::System => {
-                self.monitor.update();
-            }
-            AppView::Containers | AppView::ContainerLogs(_) | AppView::ContainerLogsMulti(_) => {
-                if self.docker_monitor.is_available() {
-                    self.docker_monitor.update();
-                }
-            }
-            AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
-                if self.swarm_monitor.is_swarm() {
-                    self.swarm_monitor.update();
-                }
-            }
-            AppView::FleetOverview | AppView::Remote { .. } => {
-                // Fleet refreshes are driven by per-host tokio tasks via mpsc;
-                // poll_fleet() / poll_remote_* drain those updates each tick.
-                // The actual SSH I/O happens in the background tasks.
-            }
-        }
+        self.dispatch_active_update();
 
         if !self.swarm_monitor.is_swarm() && self.tick_counter % 10 == 0 {
             self.swarm_monitor.recheck_swarm();
@@ -122,36 +127,16 @@ impl App {
         let now = Instant::now();
         if self.app_view != self.prev_app_view {
             // Gate expensive background collectors on whether their tab
-            // is the active view. Currently only the macOS `nettop` loop
-            // listens to this, but the flag lives on every Monitor so
-            // future collectors can opt in for free.
+            // is the active view. Only the macOS `nettop` loop actually
+            // listens to this today, but the flag lives on every
+            // `DataMonitor` via the trait so future collectors can opt
+            // in for free.
             let system_active = matches!(self.app_view, AppView::System);
             self.monitor.set_active(system_active);
 
             let since_last = now.duration_since(self.last_tab_refresh);
             if since_last >= self.min_refresh_interval {
-                match &self.app_view {
-                    AppView::System => {
-                        self.monitor.update();
-                    }
-                    AppView::Containers
-                    | AppView::ContainerLogs(_)
-                    | AppView::ContainerLogsMulti(_) => {
-                        if self.docker_monitor.is_available() {
-                            self.docker_monitor.update();
-                        }
-                    }
-                    AppView::Swarm
-                    | AppView::SwarmServiceTasks(_, _)
-                    | AppView::SwarmServiceLogs(_, _) => {
-                        if self.swarm_monitor.is_swarm() {
-                            self.swarm_monitor.update();
-                        }
-                    }
-                    AppView::FleetOverview | AppView::Remote { .. } => {
-                        // No-op: fleet refreshes are pushed by per-host tasks.
-                    }
-                }
+                self.dispatch_active_update();
                 self.last_tab_refresh = now;
             }
             self.prev_app_view = self.app_view.clone();

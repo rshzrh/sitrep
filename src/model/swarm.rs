@@ -1,5 +1,5 @@
+use parking_lot::Mutex;
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -148,7 +148,7 @@ pub struct ServiceLogState {
     pub search_query: String,
     pub truncated_count: u64,
     line_version: u64,
-    filter_cache: RefCell<Option<ServiceLogFilterCache>>,
+    filter_cache: Mutex<Option<ServiceLogFilterCache>>,
 }
 
 impl ServiceLogState {
@@ -164,7 +164,7 @@ impl ServiceLogState {
             search_query: String::new(),
             truncated_count: 0,
             line_version: 0,
-            filter_cache: RefCell::new(None),
+            filter_cache: Mutex::new(None),
         }
     }
 
@@ -175,13 +175,13 @@ impl ServiceLogState {
         }
         self.lines.push_back(line);
         self.line_version += 1;
-        *self.filter_cache.borrow_mut() = None;
+        *self.filter_cache.lock() = None;
     }
 
     pub fn with_filtered_indices<R>(&self, f: impl FnOnce(&[usize]) -> R) -> R {
         let query = self.search_query.to_lowercase();
         let filter_errors = self.filter_errors;
-        let mut cache = self.filter_cache.borrow_mut();
+        let mut cache = self.filter_cache.lock();
         let cache_miss = cache
             .as_ref()
             .map(|cached| {

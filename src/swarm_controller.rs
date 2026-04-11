@@ -404,3 +404,20 @@ impl SwarmMonitor {
         }
     }
 }
+
+impl crate::controller::DataMonitor for SwarmMonitor {
+    fn update(&mut self) {
+        SwarmMonitor::update(self);
+    }
+
+    fn poll_update(&mut self) -> bool {
+        // SwarmMonitor::update is synchronous — data is ready when
+        // update() returns, so there's nothing async to drain.
+        false
+    }
+
+    fn is_available(&self) -> bool {
+        self.is_swarm()
+    }
+    // set_active: trait default.
+}

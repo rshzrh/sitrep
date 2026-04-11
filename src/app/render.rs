@@ -231,7 +231,11 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
     let mut out = io::stdout();
     execute!(out, Clear(ClearType::All), MoveTo(0, 0))?;
 
-    let Some(rh) = app.remote_hosts.get(host_idx) else {
+    // Mutable borrow held for the whole function so we can write back
+    // `row_mapping` / `ui_state` at the end. `app.app_view` is a
+    // separate field, so Rust's split-borrow lets us still read it
+    // for the tab bar.
+    let Some(rh) = app.remote_hosts.get_mut(host_idx) else {
         return Ok(());
     };
 
@@ -291,7 +295,7 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
                     s.ui_state = ui_clone;
                     s.prev_selected_pid = current_pid;
                 }
-                app.remote_row_mappings.insert(host_idx, row_mapping);
+                rh.row_mapping = row_mapping;
             } else {
                 use std::io::Write;
                 write!(out, "  (connecting...)\r\n")?;
@@ -306,8 +310,7 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
             )?;
         }
         RemoteTab::ContainerLogs(container_id) => {
-            let key = (host_idx, container_id.clone());
-            if let Some(log_state) = app.remote_log_states.get(&key) {
+            if let Some(log_state) = rh.log_states.get(container_id) {
                 Presenter::render_logs(log_state)?;
             } else {
                 use std::io::Write;
@@ -320,7 +323,7 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
             }
         }
         RemoteTab::ContainerLogsMulti(pairs) => {
-            if let Some(multi_state) = app.remote_multi_logs.get(&host_idx) {
+            if let Some(multi_state) = rh.multi_log.as_ref() {
                 let mut names: Vec<String> = pairs.iter().map(|(_, n)| n.clone()).collect();
                 names.sort();
                 names.dedup();
@@ -359,7 +362,7 @@ fn render_remote_tab(app: &mut App, host_idx: usize, tab: &RemoteTab) -> io::Res
             )?;
         }
         RemoteTab::SwarmServiceLogs(_, _) => {
-            if let Some(svc_state) = app.remote_service_logs.get(&host_idx) {
+            if let Some(svc_state) = rh.service_log.as_ref() {
                 Presenter::render_service_logs(svc_state)?;
             } else {
                 use std::io::Write;

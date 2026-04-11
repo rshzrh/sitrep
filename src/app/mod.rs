@@ -20,7 +20,6 @@ use crate::remote_host::RemoteHost;
 use crate::swarm_controller::SwarmMonitor;
 use crate::model::{AppView, FleetState, LogViewState, MultiLogLine, MultiLogViewState, ServiceLogState};
 use crate::view::{Presenter, RowKind};
-use std::collections::HashMap;
 use sysinfo::Pid;
 
 pub use state::{PendingAction, PendingActionKind, SwarmOverviewItem, resolve_swarm_overview_item};
@@ -49,22 +48,11 @@ pub struct App {
     /// more host arguments. None means single-host (legacy) mode.
     pub fleet_state: Option<FleetState>,
     /// Per-host orchestrators. Parallel to `fleet_state.hosts`.
+    /// Per-host UI state (log streams, row mappings, etc.) lives on
+    /// `RemoteHost` itself — see the A3/A8 refactor in the eng review.
+    /// Dropping a host drops its UI state automatically; no HashMap
+    /// leaks on host removal.
     pub remote_hosts: Vec<RemoteHost>,
-    /// Log view states keyed by stream id (container id or service id),
-    /// per host. Main loop drains `remote_hosts[i].log_rx` into these
-    /// each tick. `LogViewState` is non-Send (contains RefCell), which
-    /// is why we can't store it on `RemoteHost` itself.
-    pub remote_log_states: HashMap<(usize, String), LogViewState>,
-    /// Per-host service log state. One active service log per host.
-    pub remote_service_logs: HashMap<usize, ServiceLogState>,
-    /// Per-host multi-container log state. Created when user presses
-    /// l/L on the remote Containers tab. Keyed by host index.
-    pub remote_multi_logs: HashMap<usize, MultiLogViewState>,
-    /// Per-host row mapping produced by `Presenter::render` for the
-    /// remote System tab. Needed by `handle_remote_system` to resolve
-    /// Up/Down/Left/Right key presses into section toggles and process
-    /// group expansions (the same way the local path uses `row_mapping`).
-    pub remote_row_mappings: HashMap<usize, Vec<(Pid, RowKind)>>,
     /// Tokio runtime shared with the remote tasks (needed to spawn log
     /// streams and action tasks from the input handlers).
     pub rt: Arc<tokio::runtime::Runtime>,
@@ -105,10 +93,6 @@ impl App {
             min_refresh_interval: Duration::from_millis(500),
             fleet_state: None,
             remote_hosts: Vec::new(),
-            remote_log_states: HashMap::new(),
-            remote_service_logs: HashMap::new(),
-            remote_multi_logs: HashMap::new(),
-            remote_row_mappings: HashMap::new(),
             rt,
         }
     }
@@ -189,15 +173,11 @@ impl App {
     /// 1. If the host has an active multi-log view AND the line's container
     ///    id is in the multi-log set → push into `remote_multi_logs[host]`.
     /// 2. If the line matches a container id → push into
-    ///    `remote_log_states[(host, id)]`.
-    /// 3. Otherwise → push into `remote_service_logs[host]` (service log).
+    ///    `rh.log_states[id]`.
+    /// 3. Otherwise → push into `rh.service_log` (service log).
     pub fn poll_remote_logs(&mut self) -> bool {
         let mut changed = false;
-        for (i, rh) in self.remote_hosts.iter_mut().enumerate() {
-            let Some(rx) = rh.log_rx.as_mut() else {
-                continue;
-            };
-
+        for rh in self.remote_hosts.iter_mut() {
             // Snapshot everything we need in one brief lock: the
             // multi-log ids, the container id set (for O(1) routing),
             // and an Arc clone of the container list (for name lookup
@@ -212,6 +192,10 @@ impl App {
                 )
             };
 
+            let Some(rx) = rh.log_rx.as_mut() else {
+                continue;
+            };
+
             while let Ok(line) = rx.try_recv() {
                 // Route 1: multi-log view active and this container is in it.
                 if !multi_ids.is_empty() && multi_ids.contains(&line.stream_id) {
@@ -222,10 +206,7 @@ impl App {
                         .find(|c| c.id == line.stream_id)
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| line.stream_id.clone());
-                    let multi = self
-                        .remote_multi_logs
-                        .entry(i)
-                        .or_insert_with(MultiLogViewState::new);
+                    let multi = rh.multi_log.get_or_insert_with(MultiLogViewState::new);
                     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     multi.push_line(MultiLogLine {
                         container_id: line.stream_id.clone(),
@@ -239,24 +220,19 @@ impl App {
 
                 // Route 2: single-container log — O(1) HashSet membership
                 // check instead of a linear scan over the container Vec.
-                let is_container = container_ids.contains(&line.stream_id);
-                if is_container {
-                    let key = (i, line.stream_id.clone());
-                    let log_state = self
-                        .remote_log_states
-                        .entry(key)
+                if container_ids.contains(&line.stream_id) {
+                    let log_state = rh
+                        .log_states
+                        .entry(line.stream_id.clone())
                         .or_insert_with(|| {
                             LogViewState::new(line.stream_id.clone(), line.stream_id.clone())
                         });
                     log_state.push_line(line.line);
                 } else {
                     // Route 3: service log.
-                    let svc_state = self
-                        .remote_service_logs
-                        .entry(i)
-                        .or_insert_with(|| {
-                            ServiceLogState::new(line.stream_id.clone(), line.stream_id.clone())
-                        });
+                    let svc_state = rh.service_log.get_or_insert_with(|| {
+                        ServiceLogState::new(line.stream_id.clone(), line.stream_id.clone())
+                    });
                     svc_state.push_line(line.line);
                 }
                 changed = true;
@@ -266,16 +242,13 @@ impl App {
     }
 
     /// Clean up all remote state. Called when the user quits or the
-    /// App is dropped. Stops all active log streams, clears all
-    /// cached per-host view state, and drops the tokio tasks.
+    /// App is dropped. Stops all active log streams. The per-host UI
+    /// state (log_states, service_log, multi_log, row_mapping) is
+    /// freed automatically when `remote_hosts` is dropped.
     pub fn cleanup_remote(&mut self) {
         for rh in &self.remote_hosts {
             rh.stop_all_log_streams();
         }
-        self.remote_log_states.clear();
-        self.remote_service_logs.clear();
-        self.remote_multi_logs.clear();
-        self.remote_row_mappings.clear();
     }
 
     /// Drain remote action results. Sets the status message on the

@@ -430,3 +430,18 @@ fn capitalize(s: &str) -> String {
         Some(f) => f.to_uppercase().to_string() + c.as_str(),
     }
 }
+
+impl crate::controller::DataMonitor for DockerMonitor {
+    fn update(&mut self) {
+        DockerMonitor::update(self);
+    }
+
+    fn poll_update(&mut self) -> bool {
+        DockerMonitor::poll_update(self)
+    }
+
+    fn is_available(&self) -> bool {
+        DockerMonitor::is_available(self)
+    }
+    // set_active: trait default (no expensive background work to pause).
+}

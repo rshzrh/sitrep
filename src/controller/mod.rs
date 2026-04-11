@@ -2,6 +2,39 @@
 
 mod process;
 
+/// Shared lifecycle contract implemented by every data-producing
+/// monitor: `Monitor` (system metrics), `DockerMonitor` (containers),
+/// `SwarmMonitor` (swarm cluster). A narrow trait by design — it only
+/// covers the calls the event loop makes during a tick (`update`,
+/// `poll_update`, `is_available`, `set_active`). Each monitor still
+/// exposes its own typed accessors for render and input handlers.
+///
+/// Adding a 4th monitor (Kubernetes, systemd, etc.) means: implement
+/// this trait + add a `TabKind` variant + wire it into the `App`
+/// dispatch helper. See A1 in the eng review.
+pub trait DataMonitor {
+    /// Kick a background refresh. Idempotent — calling while an
+    /// update is already in flight is a no-op.
+    fn update(&mut self);
+
+    /// Drain any completed background update. Returns `true` if
+    /// visible state changed (i.e. a render is needed).
+    fn poll_update(&mut self) -> bool;
+
+    /// Whether the monitor's data source is reachable and its tab
+    /// should be shown/refreshed. Default: always available (for
+    /// monitors with no initialization failure mode).
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    /// Tell the monitor whether its tab is currently the active
+    /// (user-visible) tab. Monitors with expensive background work
+    /// (e.g. the macOS `nettop` loop on `Monitor`) use this to pause
+    /// that work when the user has switched away. Default: no-op.
+    fn set_active(&self, _active: bool) {}
+}
+
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -142,6 +175,22 @@ impl Monitor {
             }
         }
     }
+}
+
+impl DataMonitor for Monitor {
+    fn update(&mut self) {
+        Monitor::update(self);
+    }
+
+    fn poll_update(&mut self) -> bool {
+        Monitor::poll_update(self)
+    }
+
+    fn set_active(&self, active: bool) {
+        Monitor::set_active(self, active);
+    }
+    // is_available: uses trait default — the local system monitor
+    // has no "unavailable" state; sysinfo always works.
 }
 
 impl MonitorWorkerState {

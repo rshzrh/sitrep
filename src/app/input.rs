@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::model::{AppView, SortColumn, SwarmViewLevel};
+use crate::model::{AppView, SortColumn, SwarmViewLevel, TabKind};
 use crate::view::RowKind;
 
 use super::state::{resolve_swarm_overview_item, PendingAction, PendingActionKind};
@@ -100,56 +100,59 @@ pub fn handle_key(app: &mut App, key_event: KeyEvent) -> Option<InputResult> {
     None
 }
 
-fn next_tab(app: &App) -> AppView {
-    match &app.app_view {
-        AppView::System => {
-            if app.docker_monitor.is_available() {
-                AppView::Containers
-            } else if app.swarm_monitor.is_swarm() {
-                AppView::Swarm
-            } else {
-                AppView::System
-            }
-        }
-        AppView::Containers | AppView::ContainerLogs(_) | AppView::ContainerLogsMulti(_) => {
-            if app.swarm_monitor.is_swarm() {
-                AppView::Swarm
-            } else {
-                AppView::System
-            }
-        }
-        AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
-            AppView::System
-        }
-        AppView::FleetOverview => AppView::FleetOverview, // Tab is a no-op in fleet view
-        AppView::Remote { .. } => app.app_view.clone(),
+/// Build the ordered list of visible top-level tab kinds given what's
+/// available right now. System is always present; Containers only if
+/// Docker is reachable; Swarm only if swarm mode is detected. This is
+/// the single source of truth for tab ordering — next_tab and prev_tab
+/// both read from it. See A2-lite in the eng review.
+fn visible_tab_kinds(app: &App) -> Vec<TabKind> {
+    let mut kinds = vec![TabKind::System];
+    if app.docker_monitor.is_available() {
+        kinds.push(TabKind::Containers);
+    }
+    if app.swarm_monitor.is_swarm() {
+        kinds.push(TabKind::Swarm);
+    }
+    kinds
+}
+
+/// Landing `AppView` for a given tab kind — i.e. the variant you end
+/// up in when you Tab into that top-level tab fresh. Drill-in state
+/// (ContainerLogs, SwarmServiceTasks, etc.) is discarded on tab
+/// switch, which matches the previous behavior.
+fn landing_view_for(kind: TabKind) -> AppView {
+    match kind {
+        TabKind::System => AppView::System,
+        TabKind::Containers => AppView::Containers,
+        TabKind::Swarm => AppView::Swarm,
+        TabKind::Fleet => AppView::FleetOverview,
+        // Remote has no standalone landing view (it's always
+        // host-qualified). Tab cycling is a no-op inside Remote mode;
+        // callers short-circuit before reaching here.
+        TabKind::Remote => AppView::FleetOverview,
     }
 }
 
-fn prev_tab(app: &App) -> AppView {
-    match &app.app_view {
-        AppView::System => {
-            if app.swarm_monitor.is_swarm() {
-                AppView::Swarm
-            } else if app.docker_monitor.is_available() {
-                AppView::Containers
-            } else {
-                AppView::System
-            }
-        }
-        AppView::Containers | AppView::ContainerLogs(_) | AppView::ContainerLogsMulti(_) => {
-            AppView::System
-        }
-        AppView::Swarm | AppView::SwarmServiceTasks(_, _) | AppView::SwarmServiceLogs(_, _) => {
-            if app.docker_monitor.is_available() {
-                AppView::Containers
-            } else {
-                AppView::System
-            }
-        }
-        AppView::FleetOverview => AppView::FleetOverview,
-        AppView::Remote { .. } => app.app_view.clone(),
+fn next_tab(app: &App) -> AppView {
+    // Fleet + Remote modes don't cycle — Tab is a no-op there.
+    if matches!(app.app_view.tab_kind(), TabKind::Fleet | TabKind::Remote) {
+        return app.app_view.clone();
     }
+    let kinds = visible_tab_kinds(app);
+    let current = app.app_view.tab_kind();
+    let idx = kinds.iter().position(|k| *k == current).unwrap_or(0);
+    landing_view_for(kinds[(idx + 1) % kinds.len()])
+}
+
+fn prev_tab(app: &App) -> AppView {
+    if matches!(app.app_view.tab_kind(), TabKind::Fleet | TabKind::Remote) {
+        return app.app_view.clone();
+    }
+    let kinds = visible_tab_kinds(app);
+    let current = app.app_view.tab_kind();
+    let idx = kinds.iter().position(|k| *k == current).unwrap_or(0);
+    let n = kinds.len();
+    landing_view_for(kinds[(idx + n - 1) % n])
 }
 
 /// Fleet overview keyboard handling. Up/Down navigate the host list,
@@ -219,16 +222,17 @@ fn handle_remote(app: &mut App, code: KeyCode) -> Option<InputResult> {
                     }
                     // Clean up per-host render state on drill-out so it
                     // doesn't grow unboundedly across repeated drill-ins.
-                    app.remote_row_mappings.remove(&host_idx);
+                    if let Some(rh) = app.remote_hosts.get_mut(host_idx) {
+                        rh.row_mapping.clear();
+                    }
                     app.app_view = AppView::FleetOverview;
                 }
                 RemoteTab::ContainerLogs(ref id) => {
                     // Stop the log stream, clear cached lines, return to Containers.
-                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                    if let Some(rh) = app.remote_hosts.get_mut(host_idx) {
                         rh.stop_log_stream(id);
+                        rh.log_states.remove(id);
                     }
-                    let key = (host_idx, id.clone());
-                    app.remote_log_states.remove(&key);
                     app.app_view = AppView::Remote {
                         host: host_idx,
                         tab: RemoteTab::Containers,
@@ -236,14 +240,13 @@ fn handle_remote(app: &mut App, code: KeyCode) -> Option<InputResult> {
                 }
                 RemoteTab::ContainerLogsMulti(ref pairs) => {
                     // Stop all active log streams + clear multi-log state.
-                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                    if let Some(rh) = app.remote_hosts.get_mut(host_idx) {
                         for (id, _) in pairs {
                             rh.stop_log_stream(id);
                         }
-                        let mut s = rh.state.lock();
-                        s.multi_log_container_ids.clear();
+                        rh.state.lock().multi_log_container_ids.clear();
+                        rh.multi_log = None;
                     }
-                    app.remote_multi_logs.remove(&host_idx);
                     app.app_view = AppView::Remote {
                         host: host_idx,
                         tab: RemoteTab::Containers,
@@ -256,10 +259,10 @@ fn handle_remote(app: &mut App, code: KeyCode) -> Option<InputResult> {
                     };
                 }
                 RemoteTab::SwarmServiceLogs(ref id, _) => {
-                    if let Some(rh) = app.remote_hosts.get(host_idx) {
+                    if let Some(rh) = app.remote_hosts.get_mut(host_idx) {
                         rh.stop_log_stream(id);
+                        rh.service_log = None;
                     }
-                    app.remote_service_logs.remove(&host_idx);
                     app.app_view = AppView::Remote {
                         host: host_idx,
                         tab: RemoteTab::Swarm,
@@ -319,7 +322,7 @@ fn handle_remote(app: &mut App, code: KeyCode) -> Option<InputResult> {
 /// target host's `RemoteHostState` (locked briefly per mutation) so the
 /// state persists across refreshes.
 ///
-/// Row-to-section mapping is resolved via `app.remote_row_mappings[host_idx]`,
+/// Row-to-section mapping is resolved via `rh.row_mapping`,
 /// populated by the render path each frame.
 fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option<InputResult> {
     use crate::model::SortColumn;
@@ -350,7 +353,7 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
             // has no child processes — expanding would be a no-op that
             // confusingly triggers the "frozen" warning. Section headers
             // still toggle because they're layout state, not data.
-            let row_mapping = app.remote_row_mappings.get(&host_idx)?.clone();
+            let row_mapping = rh.row_mapping.clone();
             let mut s = rh.state.lock();
             let idx = s.ui_state.selected_index;
             if idx < row_mapping.len() {
@@ -368,7 +371,7 @@ fn handle_remote_system(app: &mut App, host_idx: usize, code: KeyCode) -> Option
         Left => {
             // Left: collapse an expanded section header. ProcessParent /
             // ProcessChild collapse is disabled on remote (no children).
-            let row_mapping = app.remote_row_mappings.get(&host_idx)?.clone();
+            let row_mapping = rh.row_mapping.clone();
             let mut s = rh.state.lock();
             let idx = s.ui_state.selected_index;
             if idx < row_mapping.len() {
@@ -577,12 +580,11 @@ fn handle_remote_container_logs(
     code: KeyCode,
 ) -> Option<InputResult> {
     use crossterm::event::KeyCode::*;
-    let key = (host_idx, container_id.to_string());
+    let rh = app.remote_hosts.get_mut(host_idx)?;
 
     // ── search mode: when active, intercept character input ──
-    if let Some(log_state) = app.remote_log_states.get(&key) {
+    if let Some(log_state) = rh.log_states.get_mut(container_id) {
         if log_state.search_mode {
-            let log_state = app.remote_log_states.get_mut(&key).unwrap();
             return match code {
                 Enter => {
                     log_state.search_mode = false;
@@ -609,16 +611,17 @@ fn handle_remote_container_logs(
     // ── normal mode ──
     // ALWAYS consume navigation keys even if log_state doesn't exist
     // yet (still waiting for the first line).
+    let log_state = rh.log_states.get_mut(container_id);
     match code {
         Char('/') => {
-            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+            if let Some(log_state) = log_state {
                 log_state.search_mode = true;
                 log_state.search_query.clear();
             }
             Some(InputResult::Consumed)
         }
         Up => {
-            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+            if let Some(log_state) = log_state {
                 if log_state.scroll_offset < log_state.lines.len().saturating_sub(1) {
                     log_state.scroll_offset += 1;
                     log_state.auto_follow = false;
@@ -627,7 +630,7 @@ fn handle_remote_container_logs(
             Some(InputResult::Consumed)
         }
         Down => {
-            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+            if let Some(log_state) = log_state {
                 if log_state.scroll_offset > 0 {
                     log_state.scroll_offset -= 1;
                 }
@@ -638,7 +641,7 @@ fn handle_remote_container_logs(
             Some(InputResult::Consumed)
         }
         PageUp => {
-            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+            if let Some(log_state) = log_state {
                 let page = 20;
                 log_state.scroll_offset = log_state
                     .scroll_offset
@@ -649,7 +652,7 @@ fn handle_remote_container_logs(
             Some(InputResult::Consumed)
         }
         PageDown => {
-            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+            if let Some(log_state) = log_state {
                 log_state.scroll_offset = log_state.scroll_offset.saturating_sub(20);
                 if log_state.scroll_offset == 0 {
                     log_state.auto_follow = true;
@@ -658,7 +661,7 @@ fn handle_remote_container_logs(
             Some(InputResult::Consumed)
         }
         Char('f') | End => {
-            if let Some(log_state) = app.remote_log_states.get_mut(&key) {
+            if let Some(log_state) = log_state {
                 log_state.scroll_offset = 0;
                 log_state.auto_follow = true;
             }
@@ -670,10 +673,12 @@ fn handle_remote_container_logs(
 
 fn handle_remote_multi_log(app: &mut App, host_idx: usize, code: KeyCode) -> Option<InputResult> {
     use crossterm::event::KeyCode::*;
+    let rh = app.remote_hosts.get_mut(host_idx)?;
+    let ml = rh.multi_log.as_mut();
     // Always-consume pattern. Multi-log scrolling — same as container logs.
     match code {
         Up => {
-            if let Some(ml) = app.remote_multi_logs.get_mut(&host_idx) {
+            if let Some(ml) = ml {
                 if ml.scroll_offset < ml.lines.len().saturating_sub(1) {
                     ml.scroll_offset += 1;
                     ml.auto_follow = false;
@@ -682,7 +687,7 @@ fn handle_remote_multi_log(app: &mut App, host_idx: usize, code: KeyCode) -> Opt
             Some(InputResult::Consumed)
         }
         Down => {
-            if let Some(ml) = app.remote_multi_logs.get_mut(&host_idx) {
+            if let Some(ml) = ml {
                 if ml.scroll_offset > 0 {
                     ml.scroll_offset -= 1;
                 }
@@ -693,7 +698,7 @@ fn handle_remote_multi_log(app: &mut App, host_idx: usize, code: KeyCode) -> Opt
             Some(InputResult::Consumed)
         }
         Char('f') | End => {
-            if let Some(ml) = app.remote_multi_logs.get_mut(&host_idx) {
+            if let Some(ml) = ml {
                 ml.scroll_offset = 0;
                 ml.auto_follow = true;
             }
@@ -799,11 +804,11 @@ fn handle_remote_service_logs(
     code: KeyCode,
 ) -> Option<InputResult> {
     use crossterm::event::KeyCode::*;
+    let rh = app.remote_hosts.get_mut(host_idx)?;
 
     // ── search mode ──
-    if let Some(log_state) = app.remote_service_logs.get(&host_idx) {
+    if let Some(log_state) = rh.service_log.as_mut() {
         if log_state.search_mode {
-            let log_state = app.remote_service_logs.get_mut(&host_idx).unwrap();
             return match code {
                 Enter => {
                     log_state.search_mode = false;
@@ -828,9 +833,10 @@ fn handle_remote_service_logs(
     }
 
     // ── normal mode ──
+    let log_state = rh.service_log.as_mut();
     match code {
         Char('/') => {
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 log_state.search_mode = true;
                 log_state.search_query.clear();
             }
@@ -838,20 +844,20 @@ fn handle_remote_service_logs(
         }
         Char('e') => {
             // Toggle error-only filter (ERROR, panic, fatal, exception).
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 log_state.filter_errors = !log_state.filter_errors;
             }
             Some(InputResult::Consumed)
         }
         Up => {
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 log_state.scroll_offset = log_state.scroll_offset.saturating_add(1);
                 log_state.auto_follow = false;
             }
             Some(InputResult::Consumed)
         }
         Down => {
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 if log_state.scroll_offset > 0 {
                     log_state.scroll_offset -= 1;
                 }
@@ -862,14 +868,14 @@ fn handle_remote_service_logs(
             Some(InputResult::Consumed)
         }
         PageUp => {
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 log_state.scroll_offset = log_state.scroll_offset.saturating_add(20);
                 log_state.auto_follow = false;
             }
             Some(InputResult::Consumed)
         }
         PageDown => {
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 log_state.scroll_offset = log_state.scroll_offset.saturating_sub(20);
                 if log_state.scroll_offset == 0 {
                     log_state.auto_follow = true;
@@ -878,7 +884,7 @@ fn handle_remote_service_logs(
             Some(InputResult::Consumed)
         }
         Char('f') | End => {
-            if let Some(log_state) = app.remote_service_logs.get_mut(&host_idx) {
+            if let Some(log_state) = log_state {
                 log_state.scroll_offset = 0;
                 log_state.auto_follow = true;
             }

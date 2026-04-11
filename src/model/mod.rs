@@ -1,6 +1,6 @@
 // Re-export all model types from submodules for backward compatibility.
 
-pub use app::{AppView, RemoteTab};
+pub use app::{AppView, RemoteTab, TabKind};
 pub use docker::{
     ContainerUIState, DockerContainerInfo, LogViewState, MultiLogLine, MultiLogViewState,
 };

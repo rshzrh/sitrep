@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -39,7 +39,7 @@ pub struct LogViewState {
     pub search_query: String, // current search text
     pub truncated_count: u64, // number of lines dropped due to buffer cap
     line_version: u64,
-    search_cache: RefCell<Option<LogSearchCache>>,
+    search_cache: Mutex<Option<LogSearchCache>>,
 }
 
 impl LogViewState {
@@ -54,7 +54,7 @@ impl LogViewState {
             search_query: String::new(),
             truncated_count: 0,
             line_version: 0,
-            search_cache: RefCell::new(None),
+            search_cache: Mutex::new(None),
         }
     }
 
@@ -65,12 +65,12 @@ impl LogViewState {
         }
         self.lines.push_back(line);
         self.line_version += 1;
-        *self.search_cache.borrow_mut() = None;
+        *self.search_cache.lock() = None;
     }
 
     pub fn with_filtered_indices<R>(&self, f: impl FnOnce(&[usize]) -> R) -> R {
         let query = self.search_query.to_lowercase();
-        let mut cache = self.search_cache.borrow_mut();
+        let mut cache = self.search_cache.lock();
         let cache_miss = cache
             .as_ref()
             .map(|cached| cached.line_version != self.line_version || cached.query != query)
@@ -113,7 +113,7 @@ pub struct MultiLogViewState {
     pub search_query: String,
     pub truncated_count: u64,
     line_version: u64,
-    search_cache: RefCell<Option<MultiLogSearchCache>>,
+    search_cache: Mutex<Option<MultiLogSearchCache>>,
 }
 
 impl MultiLogViewState {
@@ -126,7 +126,7 @@ impl MultiLogViewState {
             search_query: String::new(),
             truncated_count: 0,
             line_version: 0,
-            search_cache: RefCell::new(None),
+            search_cache: Mutex::new(None),
         }
     }
 
@@ -137,12 +137,12 @@ impl MultiLogViewState {
         }
         self.lines.push_back(line);
         self.line_version += 1;
-        *self.search_cache.borrow_mut() = None;
+        *self.search_cache.lock() = None;
     }
 
     pub fn with_filtered_indices<R>(&self, f: impl FnOnce(&[usize]) -> R) -> R {
         let query = self.search_query.to_lowercase();
-        let mut cache = self.search_cache.borrow_mut();
+        let mut cache = self.search_cache.lock();
         let cache_miss = cache
             .as_ref()
             .map(|cached| cached.line_version != self.line_version || cached.query != query)
